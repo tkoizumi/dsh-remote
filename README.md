@@ -101,6 +101,20 @@ run as your normal user (and under a user systemd service):
 sudo tailscale set --operator=$USER
 ```
 
+`dsh-remote start` checks this *before* it launches DeepSeek Harness, so a
+missing grant fails immediately rather than leaving a half-started process. When
+a terminal is available it offers to run the command for you:
+
+```text
+Tailscale Serve needs root or an operator.
+Run `sudo tailscale set --operator=you` now? [y/N]
+```
+
+The question is asked on the controlling terminal, never on stdin, and the
+default is no. With no terminal — for example under the systemd user service —
+`dsh-remote` never attempts an unattended `sudo`; it prints the command and
+exits nonzero instead.
+
 ## Usage
 
 ```bash

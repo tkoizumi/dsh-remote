@@ -1,10 +1,22 @@
 # Build output
 /bin/
 /dsh-remote
+/.probe-bin/
 
-# Local development scratch (Go toolchain, probes, test homes)
+# Local development scratch (Go toolchain, fakes, probes, test homes)
 /.tools/
 /.probe/
+/.probe-fake/
+/.probe-home/
+/.tap-work/
+/.formula-check/
+/.rel-check/
+/.cask-check/
+/.brew-src/
+
+# Transient debugging files
+/.gr.html
+/.install-check.sh
 
 # Logs
 *.log

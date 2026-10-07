@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -127,21 +128,76 @@ func runStart(args []string) error {
 	}
 	spec.TrustedHosts = append(spec.TrustedHosts, opts.trustedHosts...)
 
+	// --- Teardown ----------------------------------------------------------
+	// Defined before anything is started so every error path unwinds cleanly.
+	var (
+		proc            *dsh.Process
+		server          *proxy.Server
+		priorTarget     string
+		serveConfigured bool
+		stateSaved      bool
+	)
+	var teardownOnce sync.Once
+	teardown := func() {
+		teardownOnce.Do(func() {
+			if server != nil {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = server.Shutdown(shutdownCtx)
+				cancel()
+			}
+			if proc != nil {
+				_ = proc.Stop(5 * time.Second)
+			}
+			if serveConfigured {
+				restoreServe(ts, priorTarget, opts.proxyPort)
+			}
+			if stateSaved {
+				if err := process.RemoveState(); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: could not remove state file: %v\n", err)
+				}
+			}
+		})
+	}
+	defer teardown()
+
+	target := "http://" + dsh.Loopback + ":" + strconv.Itoa(opts.proxyPort)
+
+	// --- Tailscale Serve preflight -----------------------------------------
+	// Configure Serve before launching anything. A privilege problem then fails
+	// fast, with the chance to fix it in place, instead of after DeepSeek
+	// Harness is already running.
+	if !opts.noServe {
+		var err error
+		priorTarget, err = ts.RootTarget(ctx)
+		if err != nil {
+			return err
+		}
+		if priorTarget != "" && priorTarget != target {
+			fmt.Fprintf(os.Stderr, "warning: tailscale serve already maps / to %s; replacing it for now and restoring it on stop\n", priorTarget)
+		}
+		// Probe with the mapping that is already there when there is one, so the
+		// probe cannot break a working URL. When the root is unclaimed, probing
+		// with our own target changes nothing that worked before.
+		probe := target
+		if priorTarget != "" {
+			probe = priorTarget
+		}
+		if err := ensureServePermission(ctx, ts, probe); err != nil {
+			return err
+		}
+		if priorTarget == "" {
+			// The probe already installed our handler.
+			serveConfigured = true
+		}
+	}
+
 	// --- Launch DeepSeek Harness ------------------------------------------
 	fmt.Fprintln(os.Stderr, "Starting DeepSeek Harness...")
-	proc, err := dsh.Start(ctx, spec, os.Stderr)
+	var err error
+	proc, err = dsh.Start(ctx, spec, os.Stderr)
 	if err != nil {
 		return err
 	}
-	stopped := false
-	stopChild := func() {
-		if stopped {
-			return
-		}
-		stopped = true
-		_ = proc.Stop(5 * time.Second)
-	}
-	defer stopChild()
 
 	if _, err := proc.WaitToken(opts.tokenTimeout); err != nil {
 		return err
@@ -152,7 +208,7 @@ func runStart(args []string) error {
 	if err != nil {
 		return err
 	}
-	server := proxy.New(upstream, func() string { return proc.Token().Token }, version)
+	server = proxy.New(upstream, func() string { return proc.Token().Token }, version)
 	listener, err := proxy.Listen(opts.proxyPort)
 	if err != nil {
 		return err
@@ -160,24 +216,11 @@ func runStart(args []string) error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.Serve(listener) }()
 
-	// --- Tailscale Serve ---------------------------------------------------
-	var priorTarget string
-	serveConfigured := false
-	if !opts.noServe {
-		priorTarget, err = ts.RootTarget(ctx)
-		if err != nil {
-			return err
-		}
-		target := "http://" + dsh.Loopback + ":" + strconv.Itoa(opts.proxyPort)
-		if priorTarget != "" && priorTarget != target {
-			fmt.Fprintf(os.Stderr, "warning: tailscale serve already maps / to %s; replacing it for now and restoring it on stop\n", priorTarget)
-		}
+	// Point Serve at the proxy only now that it is listening, so replacing an
+	// existing mapping does not open a window of 502s for the current URL.
+	if !opts.noServe && !serveConfigured {
 		if err := ts.SetRootProxy(ctx, target); err != nil {
-			var perm *tailscale.PermissionError
-			if errors.As(err, &perm) {
-				return fmt.Errorf("%w\n\n%s", perm, perm.Guidance())
-			}
-			return err
+			return fmt.Errorf("configure tailscale serve: %w", err)
 		}
 		serveConfigured = true
 	}
@@ -199,19 +242,8 @@ func runStart(args []string) error {
 	}
 	if err := process.SaveState(state); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
-	}
-
-	cleanup := func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = server.Shutdown(shutdownCtx)
-		cancel()
-		stopChild()
-		if serveConfigured {
-			restoreServe(ts, priorTarget, opts.proxyPort)
-		}
-		if err := process.RemoveState(); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not remove state file: %v\n", err)
-		}
+	} else {
+		stateSaved = true
 	}
 
 	// --- Announce ----------------------------------------------------------
@@ -232,19 +264,47 @@ func runStart(args []string) error {
 	select {
 	case sig := <-sigCh:
 		fmt.Fprintf(os.Stderr, "\ndsh-remote: received %s, shutting down\n", sig)
-		cleanup()
+		teardown()
 		return nil
 	case err := <-serveErr:
-		cleanup()
+		teardown()
 		if err != nil {
 			return fmt.Errorf("stable proxy stopped unexpectedly: %w", err)
 		}
 		return errors.New("stable proxy stopped unexpectedly")
 	case <-proc.Done():
 		reason := dsh.ExitReason(proc.Err())
-		cleanup()
+		teardown()
 		return fmt.Errorf("DeepSeek Harness %s; stopping dsh-remote", reason)
 	}
+}
+
+// ensureServePermission applies one Serve root mapping, and when Tailscale
+// refuses for lack of privilege, offers the one-time operator grant on the
+// controlling terminal. Without a terminal -- notably under the systemd user
+// service -- it never attempts sudo; it fails with the exact command instead.
+func ensureServePermission(ctx context.Context, ts *tailscale.Client, mount string) error {
+	err := ts.SetRootProxy(ctx, mount)
+	if err == nil {
+		return nil
+	}
+	var perm *tailscale.PermissionError
+	if !errors.As(err, &perm) {
+		return err
+	}
+
+	granted, grantErr := offerOperatorGrant(ctx)
+	if grantErr != nil && !errors.Is(grantErr, errNoTerminal) {
+		return fmt.Errorf("%w\n\n%s", grantErr, perm.Guidance())
+	}
+	if !granted {
+		return fmt.Errorf("%w\n\n%s", perm, perm.Guidance())
+	}
+	fmt.Fprintln(os.Stderr, "Retrying Tailscale Serve...")
+	if err := ts.SetRootProxy(ctx, mount); err != nil {
+		return err
+	}
+	return nil
 }
 
 // printStartSummary prints the human-facing startup block.

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"sort"
 	"strings"
 	"time"
@@ -132,14 +133,23 @@ func (e *PermissionError) Error() string {
 
 func (e *PermissionError) Unwrap() error { return e.Err }
 
+// OperatorName returns the login name that the one-time operator grant should
+// target. `tailscale set --operator` takes a user name, so this is the
+// invoking user, with a /etc/passwd fallback when $USER is unset.
+func OperatorName() string {
+	if name := os.Getenv("USER"); name != "" {
+		return name
+	}
+	if current, err := user.Current(); err == nil && current.Username != "" {
+		return current.Username
+	}
+	return "root"
+}
+
 // Guidance returns the one-time fix for a PermissionError.
 func (e *PermissionError) Guidance() string {
-	user := os.Getenv("USER")
-	if user == "" {
-		user = "$USER"
-	}
 	return "Tailscale Serve requires root or an operator. Enable it once with:\n" +
-		"    sudo tailscale set --operator=" + user + "\n" +
+		"    sudo tailscale set --operator=" + OperatorName() + "\n" +
 		"then re-run `dsh-remote start`. Alternatively run dsh-remote with sudo."
 }
 
