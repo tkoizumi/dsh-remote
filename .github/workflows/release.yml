@@ -59,7 +59,7 @@ jobs:
           name: dsh-remote_${{ matrix.goos }}_${{ matrix.goarch }}
           path: "*.tar.gz"
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
 
   release:
     name: publish release
