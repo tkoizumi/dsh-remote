@@ -82,8 +82,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes \
-            dist/*.tar.gz dist/checksums.txt
+          set -uo pipefail
+          echo "gh $(gh --version | head -n1)"
+
+          if gh release create "${GITHUB_REF_NAME}" \
+               --title "${GITHUB_REF_NAME}" \
+               --generate-notes \
+               dist/*.tar.gz dist/checksums.txt 2>gh.err; then
+            echo "release published"
+            exit 0
+          fi
+
+          err="$(cat gh.err)"
+          echo "gh release create failed:"
+          printf '%s\n' "$err"
+
+          # Surface the error as a check annotation: those stay readable
+          # without repository write access, unlike the job logs.
+          msg="$(python3 -c 'import sys; print(sys.stdin.read().replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))' <<<"$err")"
+          echo "::error title=gh release create failed::${msg}"
+          exit 1
