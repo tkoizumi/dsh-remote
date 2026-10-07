@@ -36,8 +36,32 @@ brew install dsh-remote
 ```
 
 This works on macOS and on [Homebrew for Linux](https://docs.brew.sh/Homebrew-on-Linux)
-(including Ubuntu). The formula builds from source and declares `go` (build)
-and `node` as dependencies.
+(including Ubuntu). It installs a prebuilt binary, so it needs no Go toolchain;
+Node.js/npm is still required at runtime for `npx`.
+
+### Prebuilt binaries
+
+Every [tagged release](https://github.com/tkoizumi/dsh-remote/releases) attaches
+static binaries for Linux and macOS:
+
+```text
+dsh-remote_<version>_linux_amd64.tar.gz
+dsh-remote_<version>_linux_arm64.tar.gz
+dsh-remote_<version>_darwin_amd64.tar.gz
+dsh-remote_<version>_darwin_arm64.tar.gz
+```
+
+Replace `<version>` with a release tag, for example:
+
+```bash
+ver=0.1.1
+curl -fsSL -o dsh-remote.tar.gz \
+  "https://github.com/tkoizumi/dsh-remote/releases/download/v${ver}/dsh-remote_${ver}_linux_amd64.tar.gz"
+tar -xzf dsh-remote.tar.gz dsh-remote
+install -m755 dsh-remote ~/.local/bin/dsh-remote
+```
+
+Each release also ships `checksums.txt`.
 
 ### Go
 
