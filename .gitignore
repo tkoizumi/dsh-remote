@@ -1,20 +1,17 @@
 # Build output
 /bin/
 /dsh-remote
-/.probe-bin/
 
-# Local development scratch (Go toolchain, fakes, probes, test homes)
+# Local development scratch. Everything scratch-y is named with a leading
+# dot and this repo's prefixes, so one wildcard keeps it out of `git add -A`.
+/.probe*
 /.tools/
-/.probe/
-/.probe-fake/
-/.probe-home/
 /.tap-work/
 /.formula-check/
 /.rel-check/
 /.cask-check/
 /.brew-src/
-
-# Transient debugging files
+/.lancheck/
 /.gr.html
 /.install-check.sh
 

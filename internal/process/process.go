@@ -37,6 +37,8 @@ type State struct {
 	ProxyAddr        string    `json:"proxyAddr"`
 	TailnetHost      string    `json:"tailnetHost,omitempty"`
 	RemoteURL        string    `json:"remoteUrl,omitempty"`
+	LANAddr          string    `json:"lanAddr,omitempty"`
+	LANURL           string    `json:"lanUrl,omitempty"`
 	PriorServeTarget string    `json:"priorServeTarget,omitempty"`
 	ServeConfigured  bool      `json:"serveConfigured,omitempty"`
 	Version          string    `json:"version,omitempty"`

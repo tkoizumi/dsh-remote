@@ -17,6 +17,8 @@ func runInstall(args []string) error {
 	system := fs.Bool("system", false, "install a system-wide unit instead of a user unit")
 	force := fs.Bool("force", false, "overwrite an existing unit file")
 	startNow := fs.Bool("start", true, "enable and start the service immediately")
+	lan := fs.Bool("lan", false, "have the service serve the stable URL on the local network too")
+	lanAddress := fs.String("lan-address", "", "local network address for --lan (default: detected)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -29,7 +31,14 @@ func runInstall(args []string) error {
 		executable = resolved
 	}
 
-	unit := renderUnit(executable)
+	startFlags := ""
+	if *lan {
+		startFlags = " --lan"
+		if *lanAddress != "" {
+			startFlags += " --lan-address=" + *lanAddress
+		}
+	}
+	unit := renderUnit(executable, startFlags)
 
 	var unitPath string
 	if *system {
@@ -114,7 +123,7 @@ func runUninstall(args []string) error {
 	return nil
 }
 
-func renderUnit(executable string) string {
+func renderUnit(executable, startFlags string) string {
 	return fmt.Sprintf(`[Unit]
 Description=dsh-remote: one stable Tailscale URL for DeepSeek Harness
 Documentation=https://github.com/tkoizumi/dsh-remote
@@ -126,14 +135,14 @@ Type=simple
 # Capture the install-time PATH so npx (often installed outside /usr/bin) is
 # still resolvable under systemd's minimal environment.
 Environment=PATH=%s
-ExecStart=%s start
+ExecStart=%s start%s
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=25
 
 [Install]
 WantedBy=default.target
-`, os.Getenv("PATH"), systemdEscape(executable))
+`, os.Getenv("PATH"), systemdEscape(executable), startFlags)
 }
 
 // systemdEscape quotes a path for an ExecStart= line.

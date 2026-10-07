@@ -154,9 +154,39 @@ Useful `start` flags:
 
 - `--dsh-port` / `--proxy-port` — change the loopback ports (defaults 3080/3081).
 - `--dsh-exec <path>` — run an already-installed `dsh` directly instead of via `npx`.
+- `--lan` — also serve the stable URL on this host's local network address.
+- `--lan-address <ip>` — bind a specific local address for `--lan` (default: detected).
 - `--no-serve` — manage only the local proxy; you configure Tailscale Serve yourself.
 - `--tailnet-host <name>` — override the detected Tailscale hostname.
 - `--trusted-host <authority>` — extra authority to pass to DSH (repeatable).
+
+### Local network access (no Tailscale on the client)
+
+`--lan` adds a second listener on this host's local network address, so a laptop
+on the same WiFi can use DSH **without Tailscale**:
+
+```bash
+dsh-remote start --lan
+```
+
+```text
+Remote URL: https://ubuntu-server.tail6d6db9.ts.net/dsh
+Local network URL: http://192.168.0.151:3081/dsh
+```
+
+The first is for your phone (anywhere, via Tailscale). The second is for a
+browser on the same network — it needs no Tailscale at all. Both are served by
+this host, so both keep working when the other device is asleep.
+
+`--lan` binds only the named address, never `0.0.0.0`, and the address is added
+to DSH's `--trusted-host` list so the `/api` fence accepts it. To have the
+systemd service do this at boot:
+
+```bash
+dsh-remote install --lan
+```
+
+**Read the security note below before using `--lan`.** It is off by default.
 
 ### Surviving reboot
 
@@ -252,6 +282,21 @@ DSH also uses a WebSocket multiplexer at `/api/remote.mux`; the proxy passes
   terminal.
 - The proxy's health endpoint (`/__dsh_remote/health`) is loopback-only and
   never returns the token.
+
+### `--lan` lowers that boundary, deliberately
+
+By default the proxy binds `127.0.0.1` only, so the sole way in is Tailscale
+Serve — and the gate is tailnet membership, authenticated and encrypted.
+
+`--lan` adds a listener on your local network address over **plain HTTP**, and
+`/dsh` is an unauthenticated token dispenser: it hands a working DSH session to
+anyone who can reach it. On a home network you control that may be an acceptable
+trade. On a shared, guest, campus or café network it is not — anyone on that
+network could open `http://<your-ip>:3081/dsh` and get in.
+
+If you use `--lan`, prefer `--lan-address` with a firewall rule that restricts
+port 3081 to the specific device you intend to use, and never enable it on a
+network you do not trust. It is off by default for this reason.
 
 ### Tailscale Serve ownership
 

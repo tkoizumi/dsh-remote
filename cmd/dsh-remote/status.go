@@ -40,6 +40,7 @@ func runStatus(args []string) error {
 	dshAddr := "http://" + dsh.Loopback + ":" + strconv.Itoa(opts.dshPort)
 	dshPID := 0
 	remoteURL := ""
+	lanURL := ""
 	tailnetHost := ""
 	if state != nil {
 		if state.ProxyAddr != "" {
@@ -50,6 +51,7 @@ func runStatus(args []string) error {
 		}
 		dshPID = state.DSHPID
 		remoteURL = state.RemoteURL
+		lanURL = state.LANURL
 		tailnetHost = state.TailnetHost
 	}
 
@@ -122,6 +124,11 @@ func runStatus(args []string) error {
 		fmt.Println("https://" + tailnetHost + proxy.BootstrapPath)
 	} else {
 		fmt.Println("unknown (Tailscale hostname not detected)")
+	}
+	if lanURL != "" {
+		fmt.Println()
+		fmt.Println("Local network DSH (no Tailscale required):")
+		fmt.Println(lanURL)
 	}
 	fmt.Println()
 	return nil

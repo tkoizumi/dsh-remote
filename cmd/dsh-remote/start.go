@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"os/signal"
@@ -34,6 +35,8 @@ type startOptions struct {
 	dshExec      string
 	tailnetHost  string
 	trustedHosts stringList
+	lan          bool
+	lanAddress   string
 	noServe      bool
 	noQR         bool
 	tokenTimeout time.Duration
@@ -61,6 +64,8 @@ func runStart(args []string) error {
 	fs.StringVar(&opts.dshExec, "dsh-exec", "", "run this dsh executable directly instead of via npx")
 	fs.StringVar(&opts.tailnetHost, "tailnet-host", "", "override the detected Tailscale hostname")
 	fs.Var(&opts.trustedHosts, "trusted-host", "extra authority to pass to dsh --trusted-host (repeatable)")
+	fs.BoolVar(&opts.lan, "lan", false, "also serve the stable URL on this host's local network address (plain HTTP)")
+	fs.StringVar(&opts.lanAddress, "lan-address", "", "local network address to bind for --lan (default: detected)")
 	fs.BoolVar(&opts.noServe, "no-serve", false, "do not touch the Tailscale Serve configuration")
 	fs.BoolVar(&opts.noQR, "no-qr", false, "do not print a QR code")
 	fs.DurationVar(&opts.tokenTimeout, "token-timeout", 90*time.Second, "how long to wait for DeepSeek Harness to print its token URL")
@@ -112,6 +117,29 @@ func runStart(args []string) error {
 		return err
 	}
 
+	// --- Optional local network address ------------------------------------
+	// A MacBook on the same WiFi can use the stable URL without Tailscale, at
+	// the cost of exposing it to that network over plain HTTP.
+	lanAddr := ""
+	if opts.lan {
+		lanAddr = opts.lanAddress
+		if lanAddr == "" {
+			addresses := process.LANAddresses()
+			if len(addresses) == 0 {
+				return errors.New("--lan: no local network address found; pass --lan-address")
+			}
+			lanAddr = addresses[0]
+			if len(addresses) > 1 {
+				fmt.Fprintf(os.Stderr, "note: local network addresses %v; using %s (override with --lan-address)\n", addresses, lanAddr)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "warning: --lan publishes %s over plain HTTP to the local network; "+
+			"anyone on it can open %s and obtain a DeepSeek Harness session\n", lanAddr, proxy.BootstrapPath)
+		if err := process.PortAvailable(lanAddr, opts.proxyPort); err != nil {
+			return err
+		}
+	}
+
 	// --- Tailnet identity --------------------------------------------------
 	tailnetHost := opts.tailnetHost
 	if !opts.noServe && tailnetHost == "" {
@@ -122,9 +150,13 @@ func runStart(args []string) error {
 		tailnetHost = host
 	}
 	// DeepSeek Harness's /api fence only accepts loopback or explicitly trusted
-	// authorities, and the phone reaches it under the tailnet name.
+	// authorities. The phone arrives under the tailnet name and a browser on the
+	// local network under the LAN address, so both must be declared.
 	if tailnetHost != "" {
 		spec.TrustedHosts = append(spec.TrustedHosts, tailnetHost)
+	}
+	if lanAddr != "" {
+		spec.TrustedHosts = append(spec.TrustedHosts, lanAddr)
 	}
 	spec.TrustedHosts = append(spec.TrustedHosts, opts.trustedHosts...)
 
@@ -209,12 +241,24 @@ func runStart(args []string) error {
 		return err
 	}
 	server = proxy.New(upstream, func() string { return proc.Token().Token }, version)
-	listener, err := proxy.Listen(opts.proxyPort)
+
+	var listeners []net.Listener
+	loopbackListener, err := proxy.Listen(opts.proxyPort)
 	if err != nil {
 		return err
 	}
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- server.Serve(listener) }()
+	listeners = append(listeners, loopbackListener)
+	if lanAddr != "" {
+		lanListener, err := proxy.ListenOn(lanAddr, opts.proxyPort)
+		if err != nil {
+			return fmt.Errorf("listen on the local network address: %w", err)
+		}
+		listeners = append(listeners, lanListener)
+	}
+	serveErr := make(chan error, len(listeners))
+	for _, listener := range listeners {
+		go func() { serveErr <- server.Serve(listener) }()
+	}
 
 	// Point Serve at the proxy only now that it is listening, so replacing an
 	// existing mapping does not open a window of 502s for the current URL.
@@ -232,6 +276,7 @@ func runStart(args []string) error {
 		DSHAddr:          "http://" + dsh.Loopback + ":" + strconv.Itoa(opts.dshPort),
 		ProxyAddr:        "http://" + dsh.Loopback + ":" + strconv.Itoa(opts.proxyPort),
 		TailnetHost:      tailnetHost,
+		LANAddr:          lanAddr,
 		PriorServeTarget: priorTarget,
 		ServeConfigured:  serveConfigured,
 		Version:          version,
@@ -240,6 +285,9 @@ func runStart(args []string) error {
 	if tailnetHost != "" {
 		state.RemoteURL = "https://" + tailnetHost + proxy.BootstrapPath
 	}
+	if lanAddr != "" {
+		state.LANURL = "http://" + net.JoinHostPort(lanAddr, strconv.Itoa(opts.proxyPort)) + proxy.BootstrapPath
+	}
 	if err := process.SaveState(state); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 	} else {
@@ -247,10 +295,14 @@ func runStart(args []string) error {
 	}
 
 	// --- Announce ----------------------------------------------------------
-	printStartSummary(opts, tailnetHost, proc.PID())
-	if !opts.noQR && state.RemoteURL != "" {
+	printStartSummary(opts, tailnetHost, lanAddr, proc.PID())
+	qrURL := state.RemoteURL
+	if qrURL == "" {
+		qrURL = state.LANURL
+	}
+	if !opts.noQR && qrURL != "" {
 		fmt.Println("Scan this QR code from your phone:")
-		if err := qr.Render(os.Stdout, state.RemoteURL); err != nil {
+		if err := qr.Render(os.Stdout, qrURL); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 		}
 	}
@@ -307,20 +359,28 @@ func ensureServePermission(ctx context.Context, ts *tailscale.Client, mount stri
 	return nil
 }
 
-// printStartSummary prints the human-facing startup block.
-func printStartSummary(opts startOptions, tailnetHost string, dshPID int) {
+// printStartSummary prints the human-facing startup block. The tailnet URL is
+// for the phone (and anything off the local network); the local network URL is
+// for a browser on the same network, which then needs no Tailscale at all.
+func printStartSummary(opts startOptions, tailnetHost, lanAddr string, dshPID int) {
 	fmt.Printf("DSH listening on %s:%d\n", dsh.Loopback, opts.dshPort)
 	fmt.Printf("DSH PID: %d\n", dshPID)
 	fmt.Printf("Proxy listening on %s:%d\n", dsh.Loopback, opts.proxyPort)
+	if lanAddr != "" {
+		fmt.Printf("Proxy also listening on %s:%d (local network)\n", lanAddr, opts.proxyPort)
+	}
 	if tailnetHost != "" {
 		if opts.noServe {
 			fmt.Printf("Tailscale Serve: not managed (--no-serve)\n")
 		}
 		fmt.Printf("Remote URL: https://%s%s\n", tailnetHost, proxy.BootstrapPath)
-		return
+	} else {
+		fmt.Printf("Tailscale Serve: not configured\n")
+		fmt.Printf("Local URL: http://%s:%d%s\n", dsh.Loopback, opts.proxyPort, proxy.BootstrapPath)
 	}
-	fmt.Printf("Tailscale Serve: not configured\n")
-	fmt.Printf("Local URL: http://%s:%d%s\n", dsh.Loopback, opts.proxyPort, proxy.BootstrapPath)
+	if lanAddr != "" {
+		fmt.Printf("Local network URL: http://%s%s\n", net.JoinHostPort(lanAddr, strconv.Itoa(opts.proxyPort)), proxy.BootstrapPath)
+	}
 }
 
 // restoreServe puts back the handler dsh-remote replaced, or explains why it

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -80,6 +81,7 @@ func restoreServeOnStop(priorTarget string, proxyPort int) {
 
 func runQR(args []string) error {
 	fs := flag.NewFlagSet("qr", flag.ContinueOnError)
+	lan := fs.Bool("lan", false, "encode the local network URL instead of the Tailscale URL")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -88,6 +90,14 @@ func runQR(args []string) error {
 	if err != nil {
 		return err
 	}
+	if *lan {
+		if state == nil || state.LANURL == "" {
+			return errors.New("no local network URL recorded; start with --lan first")
+		}
+		fmt.Println(state.LANURL)
+		return qr.Render(os.Stdout, state.LANURL)
+	}
+
 	remoteURL := ""
 	if state != nil {
 		remoteURL = state.RemoteURL

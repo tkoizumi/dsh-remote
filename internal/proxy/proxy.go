@@ -173,11 +173,20 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.http.Shutdown(ctx)
 }
 
-// Listen binds the stable endpoint on loopback only. Binding anything wider
-// would put an unauthenticated redirect in front of DeepSeek Harness, so the
-// host is not configurable.
+// Listen binds the stable endpoint on loopback only.
+//
+// Loopback is the default because this endpoint turns a token into a session
+// for anyone who can reach it: on loopback the only path in is Tailscale Serve,
+// where tailnet membership is the gate. Binding a LAN address is possible via
+// ListenOn, but it is an explicit, documented trade-off (see --lan).
 func Listen(port int) (net.Listener, error) {
-	addr := net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", port))
+	return ListenOn("127.0.0.1", port)
+}
+
+// ListenOn binds the stable endpoint on the given host. The host is a literal
+// address, never 0.0.0.0, so callers must name each interface they expose.
+func ListenOn(host string, port int) (net.Listener, error) {
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", addr, err)
