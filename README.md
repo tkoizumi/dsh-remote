@@ -32,12 +32,27 @@ only needed to build from source.
 
 ```bash
 brew tap tkoizumi/tap
+brew trust tkoizumi/tap
 brew install dsh-remote
 ```
 
 This works on macOS and on [Homebrew for Linux](https://docs.brew.sh/Homebrew-on-Linux)
 (including Ubuntu). It installs a prebuilt binary, so it needs no Go toolchain;
 Node.js/npm is still required at runtime for `npx`.
+
+The `brew trust` step is required once. Homebrew refuses to load formulae or
+casks from a non-official tap until it is trusted, and otherwise fails with:
+
+```text
+Error: Refusing to load cask tkoizumi/tap/dsh-remote from untrusted tap tkoizumi/tap.
+```
+
+Trust decisions persist in `~/.homebrew/trust.json` (or under `$XDG_CONFIG_HOME`).
+To trust only this cask rather than the whole tap:
+
+```bash
+brew trust --cask tkoizumi/tap/dsh-remote
+```
 
 ### Prebuilt binaries
 
