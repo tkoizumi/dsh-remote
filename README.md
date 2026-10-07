@@ -25,7 +25,21 @@ phone only ever needs to know `/dsh`.
 
 ## Installation
 
-Requires Go 1.24+, Node.js/npm (for `npx`), and an authenticated Tailscale.
+Requires Node.js/npm (for `npx`) and an authenticated Tailscale. Go 1.24+ is
+only needed to build from source.
+
+### Homebrew
+
+```bash
+brew tap tkoizumi/tap
+brew install dsh-remote
+```
+
+This works on macOS and on [Homebrew for Linux](https://docs.brew.sh/Homebrew-on-Linux)
+(including Ubuntu). The formula builds from source and declares `go` (build)
+and `node` as dependencies.
+
+### Go
 
 ```bash
 go install github.com/tkoizumi/dsh-remote/cmd/dsh-remote@latest
