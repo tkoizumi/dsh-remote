@@ -66,6 +66,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # gh needs a git repository to resolve the repo it is releasing into.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -86,6 +91,7 @@ jobs:
           echo "gh $(gh --version | head -n1)"
 
           if gh release create "${GITHUB_REF_NAME}" \
+               --repo "${GITHUB_REPOSITORY}" \
                --title "${GITHUB_REF_NAME}" \
                --generate-notes \
                dist/*.tar.gz dist/checksums.txt 2>gh.err; then
