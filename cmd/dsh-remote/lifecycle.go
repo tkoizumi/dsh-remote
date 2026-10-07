@@ -1,0 +1,110 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/tkoizumi/dsh-remote/internal/process"
+	"github.com/tkoizumi/dsh-remote/internal/proxy"
+	"github.com/tkoizumi/dsh-remote/internal/qr"
+	"github.com/tkoizumi/dsh-remote/internal/tailscale"
+)
+
+func runStop(args []string) error {
+	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
+	proxyPort := fs.Int("proxy-port", defaultProxyPort, "loopback port the stable proxy listens on")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	start, err := process.LoadState()
+	if err != nil {
+		return err
+	}
+	if start == nil {
+		fmt.Println("nothing to stop: no dsh-remote run state was found")
+		return nil
+	}
+
+	if process.Alive(start.PID) {
+		fmt.Printf("Stopping dsh-remote (pid %d)...\n", start.PID)
+		// SIGTERM lets the start process forward the signal to DeepSeek
+		// Harness, shut the proxy down, and restore Tailscale Serve.
+		_ = process.Terminate(start.PID, 20*time.Second)
+	} else {
+		fmt.Printf("dsh-remote (pid %d) is not running; cleaning up leftover state\n", start.PID)
+	}
+	if start.DSHPID > 0 && process.Alive(start.DSHPID) {
+		fmt.Printf("Stopping leftover DeepSeek Harness (pid %d)...\n", start.DSHPID)
+		_ = process.Terminate(start.DSHPID, 10*time.Second)
+	}
+
+	// If the start process was killed hard it could not restore Serve or clear
+	// state, so finish the job here. Otherwise the file is already gone.
+	if remaining, err := process.LoadState(); err == nil && remaining != nil {
+		if remaining.ServeConfigured {
+			restoreServeOnStop(remaining.PriorServeTarget, *proxyPort)
+		}
+		if err := process.RemoveState(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not remove state file: %v\n", err)
+		}
+	}
+	fmt.Println("Stopped. Tailscale itself was left untouched.")
+	return nil
+}
+
+// restoreServeOnStop undoes the Serve mapping dsh-remote created, without ever
+// wiping unrelated configuration.
+func restoreServeOnStop(priorTarget string, proxyPort int) {
+	ts, err := tailscale.New()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cannot restore tailscale serve: %v\n", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if priorTarget != "" {
+		if err := ts.SetRootProxy(ctx, priorTarget); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not restore tailscale serve / -> %s: %v\n", priorTarget, err)
+		} else {
+			fmt.Fprintf(os.Stderr, "Restored tailscale serve / -> %s\n", priorTarget)
+		}
+		return
+	}
+	fmt.Fprintf(os.Stderr, "note: tailscale serve still maps / to the stopped proxy on port %d; "+
+		"remove it deliberately (dsh-remote never wipes unrelated Serve config)\n", proxyPort)
+}
+
+func runQR(args []string) error {
+	fs := flag.NewFlagSet("qr", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	state, err := process.LoadState()
+	if err != nil {
+		return err
+	}
+	remoteURL := ""
+	if state != nil {
+		remoteURL = state.RemoteURL
+	}
+	if remoteURL == "" {
+		ts, err := tailscale.New()
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		host, err := ts.DNSName(ctx)
+		if err != nil {
+			return err
+		}
+		remoteURL = "https://" + host + proxy.BootstrapPath
+	}
+	fmt.Println(remoteURL)
+	return qr.Render(os.Stdout, remoteURL)
+}

@@ -1,0 +1,10 @@
+# Build output
+/bin/
+/dsh-remote
+
+# Local development scratch (Go toolchain, probes, test homes)
+/.tools/
+/.probe/
+
+# Logs
+*.log
