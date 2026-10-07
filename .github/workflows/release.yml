@@ -48,7 +48,7 @@ jobs:
             -o dist/dsh-remote ./cmd/dsh-remote
 
           cp LICENSE README.md dist/
-          tar -C dist -czf "${name}.tar.gz" .
+          tar -C dist -czf "${name}.tar.gz" dsh-remote LICENSE README.md
           rm -rf dist
 
           echo "--- ${name}.tar.gz ---"

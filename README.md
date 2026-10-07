@@ -54,10 +54,10 @@ dsh-remote_<version>_darwin_arm64.tar.gz
 Replace `<version>` with a release tag, for example:
 
 ```bash
-ver=0.1.1
+ver=0.1.5
 curl -fsSL -o dsh-remote.tar.gz \
   "https://github.com/tkoizumi/dsh-remote/releases/download/v${ver}/dsh-remote_${ver}_linux_amd64.tar.gz"
-tar -xzf dsh-remote.tar.gz dsh-remote
+tar -xzf dsh-remote.tar.gz
 install -m755 dsh-remote ~/.local/bin/dsh-remote
 ```
 
