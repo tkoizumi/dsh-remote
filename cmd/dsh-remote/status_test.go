@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -337,5 +338,41 @@ func TestRenderChecksVerdictUnavailable(t *testing.T) {
 	}
 	if !strings.Contains(out, "orphaned-dsh") {
 		t.Errorf("doctor verdict did not name the failure mode:\n%s", out)
+	}
+}
+
+// TestDescribeExitAlwaysNamesACause is the regression test for a real defect seen
+// in a supervised run: a failed start logged
+//
+//	shutdown: unknown (teardown ran without recording a reason)
+//
+// for a failure whose reason was already known, which reads like an unexplained
+// crash in exactly the file that exists to prevent one.
+func TestDescribeExitAlwaysNamesACause(t *testing.T) {
+	cases := []struct {
+		name   string
+		reason string
+		cause  error
+		want   string
+	}{
+		{"explicit reason wins", "received terminated", nil, "received terminated"},
+		{"preflight refusal is named", "", errors.New("port 3080 is in use by pid 161813"), "failed: port 3080 is in use by pid 161813"},
+		{"bind failure is named", "", errors.New("port 3091 is not available on 127.0.0.1"), "failed: port 3091 is not available on 127.0.0.1"},
+		{"explicit reason beats the error", "the stable proxy stopped", errors.New("listener closed"), "the stable proxy stopped"},
+	}
+	for _, tc := range cases {
+		got := describeExit(tc.reason, tc.cause)
+		if got != tc.want {
+			t.Errorf("%s: describeExit(%q, %v) = %q, want %q", tc.name, tc.reason, tc.cause, got, tc.want)
+		}
+		if strings.Contains(got, "unknown") {
+			t.Errorf("%s: a known failure was recorded as unknown: %q", tc.name, got)
+		}
+	}
+
+	// The only case that may read as unknown is one with genuinely nothing to
+	// report, and it must say so explicitly rather than looking like a crash.
+	if got := describeExit("", nil); !strings.Contains(got, "unknown") {
+		t.Errorf("describeExit with no reason and no error = %q, want an explicit unknown", got)
 	}
 }

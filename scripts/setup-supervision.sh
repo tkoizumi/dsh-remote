@@ -103,8 +103,12 @@ fi
 
 # ---------------------------------------------------------------------------
 step "install the unit"
-# install --force keeps this idempotent when a unit already exists.
-INSTALL_ARGS=(install --force)
+# --start=false is deliberate. `install` would otherwise enable and start the
+# unit itself, and this script then restarts it. Starting twice races: two
+# dsh-remote processes each launch a DeepSeek Harness, one loses the port, and
+# the loser's child is left orphaned. Install with the unit stopped, then start
+# it exactly once below.
+INSTALL_ARGS=(install --force --start=false)
 [ "$LAN" -eq 1 ] && INSTALL_ARGS+=(--lan)
 if "$BIN" "${INSTALL_ARGS[@]}"; then
   ok "${INSTALL_ARGS[*]}"

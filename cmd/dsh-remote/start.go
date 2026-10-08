@@ -57,7 +57,11 @@ func (s *stringList) Set(value string) error {
 	return nil
 }
 
-func runStart(args []string) error {
+// runStart is declared with a named error result so the deferred teardown can
+// record why the run ended. Without it, a preflight refusal or a bind failure
+// was logged as "shutdown: unknown", which reads like an unexplained crash --
+// exactly what the persistent log exists to rule out.
+func runStart(args []string) (err error) {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	var opts startOptions
 	fs.IntVar(&opts.dshPort, "dsh-port", defaultDSHPort, "loopback port for DeepSeek Harness")
@@ -122,7 +126,7 @@ func runStart(args []string) error {
 	teardown := func() {
 		teardownOnce.Do(func() {
 			if log != nil {
-				log.Logf("shutdown: %s", describeExit(exitReason))
+				log.Logf("shutdown: %s", describeExit(exitReason, err))
 			}
 			if server != nil {
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -428,30 +432,33 @@ func runStart(args []string) error {
 	case sig := <-sigCh:
 		exitReason = fmt.Sprintf("received %s", sig)
 		fmt.Fprintf(os.Stderr, "\ndsh-remote: received %s, shutting down\n", sig)
+		// An operator asked for this, so it is a clean exit (status 0) and
+		// systemd's Restart=on-failure deliberately leaves it stopped.
 		teardown()
 		return nil
-	case err := <-serveErr:
+	case serveErrValue := <-serveErr:
 		exitReason = "the stable proxy stopped"
-		if err != nil {
-			exitReason = fmt.Sprintf("the stable proxy stopped: %v", err)
-		}
-		teardown()
-		if err != nil {
-			return fmt.Errorf("stable proxy stopped unexpectedly: %w", err)
+		if serveErrValue != nil {
+			exitReason = fmt.Sprintf("the stable proxy stopped: %v", serveErrValue)
+			return fmt.Errorf("stable proxy stopped unexpectedly: %w", serveErrValue)
 		}
 		return errors.New("stable proxy stopped unexpectedly")
 	case <-proc.Done():
 		reason := dsh.ExitReason(proc.Err())
 		exitReason = "DeepSeek Harness " + reason
-		teardown()
 		return fmt.Errorf("DeepSeek Harness %s; stopping dsh-remote", reason)
 	}
 }
 
-// describeExit renders the supervise outcome for the log.
-func describeExit(reason string) string {
+// describeExit renders the supervise outcome for the log. The error is the
+// fallback, so no exit path can be recorded as unexplained: if a reason was not
+// assigned explicitly, the failure that caused the exit still names itself.
+func describeExit(reason string, cause error) string {
 	if reason == "" {
-		return "unknown (teardown ran without recording a reason)"
+		if cause != nil {
+			return "failed: " + cause.Error()
+		}
+		return "unknown (teardown ran without recording a reason or an error)"
 	}
 	return reason
 }
