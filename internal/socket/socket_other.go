@@ -19,3 +19,14 @@ func inspectPort(port int) (int, bool) {
 	_ = conn.Close()
 	return 0, true
 }
+
+// ownsInode cannot attribute a socket to a process off Linux, so it always
+// reports no ownership. Callers treat that as "not ours" and leave the process
+// alone.
+func ownsInode(pid, inode int) bool { return false }
+
+// inodeOwner cannot identify a socket's owner off Linux.
+//
+// It returns (0, false): no pid, and not inspectable. Callers must read that as
+// "unknown" rather than "no process", and refuse to reclaim the port.
+func inodeOwner(inode int) (int, bool) { return 0, false }
