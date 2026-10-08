@@ -394,10 +394,28 @@ and Debian images do not create that directory. The dsh-remote log above lives i
 the state directory, so it persists regardless. `scripts/verify-supervision.sh`
 checks both and tells you how to make the journal persistent if it is not.
 
-### Verifying recovery on a real systemd host
+### Installing and verifying supervision
 
-The repository ships an acceptance script for the P0 reliability properties —
-supervised restart, reboot recovery, and access without an interactive session:
+Two scripts cover the install and the acceptance test.
+
+**[`scripts/setup-supervision.sh`](scripts/setup-supervision.sh)** installs the
+supervised service in the order that avoids the port-conflict loop:
+
+```bash
+bash scripts/setup-supervision.sh --lan   # or without --lan for Tailscale only
+```
+
+It stops the foreground instance first, confirms ports 3080/3081 are actually
+free, runs `install --force`, enables lingering, restarts the unit, and finishes
+with a `doctor` verdict. Safe to re-run.
+
+The ordering is the point. A foreground `start` owns both ports; installing and
+enabling the unit first makes the service fail to bind, and `Restart=on-failure`
+then loops on a conflict it can never clear. (A build old enough to lack orphan
+reclamation cannot clear it at all — 0.1.9 and earlier.)
+
+**[`scripts/verify-supervision.sh`](scripts/verify-supervision.sh)** then proves
+the recovery path rather than trusting it:
 
 ```bash
 scripts/verify-supervision.sh --no-reboot
@@ -408,6 +426,18 @@ redirect, then `SIGKILL`s the proxy's own pid and verifies systemd brings it bac
 and that no leftover DeepSeek Harness survives. Without `--no-reboot` it offers
 to reboot the machine; reconnect afterwards and re-run with `--no-reboot` to
 confirm the service came up on its own.
+
+### Why the unit uses `Restart=on-failure`
+
+Both branches are deliberate, and both are covered by tests:
+
+- A failed start exits non-zero — a taken port, a missing `npx`, an unreachable
+  Tailscale — so systemd retries.
+- An intentional `systemctl --user stop` exits 0, so systemd does not fight you
+  by restarting a service you just stopped.
+
+`Restart=always` would restart on the second case too; `on-failure` is what keeps
+`stop` meaningful while still recovering every unexpected exit.
 
 ### Running DeepSeek Harness in a VM (macOS)
 
@@ -606,7 +636,7 @@ curl -i http://127.0.0.1:3081/dsh
 ```
 
 For the systemd-side acceptance test, see
-[Verifying recovery on a real systemd host](#verifying-recovery-on-a-real-systemd-host).
+[Installing and verifying supervision](#installing-and-verifying-supervision).
 
 ## Repository layout
 
@@ -622,7 +652,7 @@ dsh-remote/
   internal/logging/      rotating persistent log with credential redaction
   internal/lima/         Lima VM control for `dsh-remote vm`
   internal/qr/           terminal QR rendering
-  scripts/               systemd acceptance test for the reliability properties
+  scripts/               systemd supervision install and acceptance tests
 ```
 
 ## License
