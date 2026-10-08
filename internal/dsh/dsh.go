@@ -222,11 +222,43 @@ func (p *Process) writeLog(line string) {
 
 // redact removes the captured token from a relayed line.
 func (p *Process) redact(line string) string {
-	tok := p.Token().Token
-	if tok == "" {
+	return RedactLine(line, p.Token().Token)
+}
+
+// RedactLine removes a known token from a line of output.
+func RedactLine(line, token string) string {
+	if token == "" {
 		return line
 	}
-	return strings.ReplaceAll(line, tok, "REDACTED")
+	return strings.ReplaceAll(line, token, RedactedMarker)
+}
+
+// RedactingWriter returns a writer that relays output with a known token
+// removed. Callers that hold the output for longer than the process's lifetime
+// -- notably the persistent log -- must use this rather than the raw log
+// writer, so a credential cannot outlive the run in a file.
+func (p *Process) RedactingWriter(w io.Writer) io.Writer {
+	if w == nil {
+		return nil
+	}
+	return &redactingWriter{dst: w, proc: p}
+}
+
+// redactingWriter resolves the token at write time, because DeepSeek Harness
+// prints the credential-containing line before the token is available.
+type redactingWriter struct {
+	dst  io.Writer
+	proc *Process
+}
+
+// RedactedMarker replaces a credential in relayed or logged output.
+const RedactedMarker = "REDACTED"
+
+func (w *redactingWriter) Write(p []byte) (int, error) {
+	if _, err := io.WriteString(w.dst, RedactLine(string(p), w.proc.Token().Token)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 // Token returns the most recently observed startup token, if any.

@@ -1,10 +1,13 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/tkoizumi/dsh-remote/internal/logging"
 	"github.com/tkoizumi/dsh-remote/internal/process"
 	"github.com/tkoizumi/dsh-remote/internal/proxy"
 	"github.com/tkoizumi/dsh-remote/internal/systemd"
@@ -169,6 +172,61 @@ func TestStatusHealthySaysNothingToDo(t *testing.T) {
 	}
 	if !strings.Contains(out, "None required.") {
 		t.Errorf("healthy status suggested an unnecessary action:\n%s", out)
+	}
+}
+
+// TestStatusReportsTheDiagnosticLog proves the report points at the file that
+// survives a restart, including how recently it was written -- which is what
+// tells an operator whether the proxy died just now or hours ago.
+func TestStatusReportsTheDiagnosticLog(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "dsh-remote.log")
+	if err := os.WriteFile(logPath, []byte("2026-10-08T13:00:00.000Z shutdown: received terminated\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DSH_REMOTE_STATE_FILE", filepath.Join(dir, "state.json"))
+
+	d := incidentDiagnose()
+	d.Log = logging.Inspect(logPath)
+
+	out := renderStatus(d, defaultOpts())
+	if !strings.Contains(out, logPath) {
+		t.Errorf("status did not name the log path:\n%s", out)
+	}
+	if !strings.Contains(out, "last entry: ") {
+		t.Errorf("status did not show the last log entry:\n%s", out)
+	}
+	if !strings.Contains(out, "shutdown: received terminated") {
+		t.Errorf("status did not surface how the last run ended:\n%s", out)
+	}
+}
+
+// TestDoctorReportsTheLog covers the doctor half of the same guarantee.
+func TestDoctorReportsTheLog(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "dsh-remote.log")
+	if err := os.WriteFile(logPath, []byte("started\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	d := doctorWith(diagnose{Log: logging.Inspect(logPath)}, systemd.State{Supported: true})
+	c := checkLog(d)
+	if c.Status != checkOK {
+		t.Fatalf("log check status = %v, want checkOK: %+v", c.Status, c)
+	}
+	if !strings.Contains(c.Detail, logPath) {
+		t.Errorf("log check did not name the path: %q", c.Detail)
+	}
+	if !strings.Contains(c.Advice, "tail -n") {
+		t.Errorf("log check advice is not actionable: %q", c.Advice)
+	}
+}
+
+// TestDoctorLogMissingIsQuiet keeps a first run from looking like a fault.
+func TestDoctorLogMissingIsQuiet(t *testing.T) {
+	c := checkLog(diagnose{Log: logging.Status{Path: "/tmp/none/dsh-remote.log"}})
+	if c.Status != checkSkip {
+		t.Fatalf("missing log status = %v, want checkSkip", c.Status)
 	}
 }
 

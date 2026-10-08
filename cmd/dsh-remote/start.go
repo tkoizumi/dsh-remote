@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/tkoizumi/dsh-remote/internal/dsh"
+	"github.com/tkoizumi/dsh-remote/internal/logging"
 	"github.com/tkoizumi/dsh-remote/internal/process"
 	"github.com/tkoizumi/dsh-remote/internal/proxy"
 	"github.com/tkoizumi/dsh-remote/internal/qr"
@@ -81,9 +83,78 @@ func runStart(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// --- Persistent log ----------------------------------------------------
+	// Opened before anything can fail, so the port preflight, the launch, and
+	// every early error path leave a record that survives the terminal, the
+	// process, and a reboot.
+	procOut := io.Writer(os.Stderr)
+	var log *logging.Logger
+	if path, logErr := logging.Path(); logErr == nil {
+		log = logging.Open(path, os.Stderr)
+		if log.Enabled() {
+			log.Logf("dsh-remote %s starting: dsh port %d, proxy port %d, serve %s",
+				version, opts.dshPort, opts.proxyPort, serveMode(opts.noServe))
+			log.Logf("log file: %s", log.Path())
+			// Every log line is redacted, so relaying DeepSeek Harness output
+			// into it cannot persist the credential.
+			procOut = io.MultiWriter(log, os.Stderr)
+		}
+	}
 	if existing != nil && process.Alive(existing.PID) {
+		if log != nil {
+			log.Logf("refusing to start: recorded proxy pid %d is still alive", existing.PID)
+			_ = log.Close()
+		}
 		return fmt.Errorf("dsh-remote is already running (pid %d); run `dsh-remote stop` first", existing.PID)
 	}
+
+	var (
+		ts              *tailscale.Client
+		proc            *dsh.Process
+		server          *proxy.Server
+		priorTarget     string
+		serveConfigured bool
+		stateSaved      bool
+		exitReason      string
+	)
+	var teardownOnce sync.Once
+	teardown := func() {
+		teardownOnce.Do(func() {
+			if log != nil {
+				log.Logf("shutdown: %s", describeExit(exitReason))
+			}
+			if server != nil {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = server.Shutdown(shutdownCtx)
+				cancel()
+				if log != nil {
+					log.Logf("proxy: stopped")
+				}
+			}
+			if proc != nil {
+				_ = proc.Stop(5 * time.Second)
+				if log != nil {
+					log.Logf("dsh: stopped (pid %d)", proc.PID())
+				}
+			}
+			if serveConfigured {
+				restoreServe(ts, priorTarget, opts.proxyPort, log)
+			}
+			if stateSaved {
+				if err := process.RemoveState(); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: could not remove state file: %v\n", err)
+				} else if log != nil {
+					log.Logf("state: removed")
+				}
+			}
+			if log != nil {
+				log.Logf("shutdown complete")
+				_ = log.Close()
+			}
+		})
+	}
+	defer teardown()
 
 	// Reclaim the DeepSeek Harness port before anything else. When the proxy is
 	// killed without running its cleanup, the child it launched keeps the port
@@ -92,8 +163,14 @@ func runStart(args []string) error {
 	// that caused it. An unrelated `dsh web` is left strictly alone.
 	preflight, err := dshPortPreflight(opts.dshPort, existing, func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, "dsh-remote: "+format+"\n", args...)
+		if log != nil {
+			log.Logf("preflight: "+format, args...)
+		}
 	})
 	if err != nil {
+		if log != nil {
+			log.Logf("preflight refused: %v", err)
+		}
 		return err
 	}
 	if preflight == portReclaimed {
@@ -120,7 +197,6 @@ func runStart(args []string) error {
 		spec.NPX = npxPath
 	}
 
-	var ts *tailscale.Client
 	if !opts.noServe {
 		var err error
 		ts, err = tailscale.New()
@@ -132,9 +208,15 @@ func runStart(args []string) error {
 	if err := process.PortAvailable(dsh.Loopback, opts.dshPort); err != nil {
 		// dshPortPreflight already reclaimed or refused an attributable holder,
 		// so reaching here means the port is held by something else entirely.
+		if log != nil {
+			log.Logf("dsh port unavailable: %v", err)
+		}
 		return fmt.Errorf("%w (held by a process dsh-remote did not launch; free it or choose another port with --dsh-port)", err)
 	}
 	if err := process.PortAvailable(dsh.Loopback, opts.proxyPort); err != nil {
+		if log != nil {
+			log.Logf("proxy port unavailable: %v", err)
+		}
 		return err
 	}
 
@@ -181,38 +263,6 @@ func runStart(args []string) error {
 	}
 	spec.TrustedHosts = append(spec.TrustedHosts, opts.trustedHosts...)
 
-	// --- Teardown ----------------------------------------------------------
-	// Defined before anything is started so every error path unwinds cleanly.
-	var (
-		proc            *dsh.Process
-		server          *proxy.Server
-		priorTarget     string
-		serveConfigured bool
-		stateSaved      bool
-	)
-	var teardownOnce sync.Once
-	teardown := func() {
-		teardownOnce.Do(func() {
-			if server != nil {
-				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_ = server.Shutdown(shutdownCtx)
-				cancel()
-			}
-			if proc != nil {
-				_ = proc.Stop(5 * time.Second)
-			}
-			if serveConfigured {
-				restoreServe(ts, priorTarget, opts.proxyPort)
-			}
-			if stateSaved {
-				if err := process.RemoveState(); err != nil {
-					fmt.Fprintf(os.Stderr, "warning: could not remove state file: %v\n", err)
-				}
-			}
-		})
-	}
-	defer teardown()
-
 	target := "http://" + dsh.Loopback + ":" + strconv.Itoa(opts.proxyPort)
 
 	// --- Tailscale Serve preflight -----------------------------------------
@@ -245,14 +295,30 @@ func runStart(args []string) error {
 	}
 
 	// --- Launch DeepSeek Harness ------------------------------------------
+	if log != nil {
+		log.Logf("dsh: launching %s", describeSpec(spec))
+	}
 	fmt.Fprintln(os.Stderr, "Starting DeepSeek Harness...")
-	proc, err = dsh.Start(ctx, spec, os.Stderr)
+	proc, err = dsh.Start(ctx, spec, procOut)
 	if err != nil {
+		if log != nil {
+			log.Logf("dsh failed to start: %v", err)
+		}
 		return err
+	}
+	if log != nil {
+		log.Logf("dsh: started with pid %d", proc.PID())
 	}
 
 	if _, err := proc.WaitToken(opts.tokenTimeout); err != nil {
+		if log != nil {
+			log.Logf("dsh: no startup token: %v", err)
+		}
 		return err
+	}
+	if log != nil {
+		// Whether the token exists is logged; its value never is.
+		log.Logf("dsh: startup token captured (value withheld)")
 	}
 
 	// --- Stable proxy ------------------------------------------------------
@@ -277,6 +343,9 @@ func runStart(args []string) error {
 	}
 	serveErr := make(chan error, len(listeners))
 	for _, listener := range listeners {
+		if log != nil {
+			log.Logf("proxy: listening on %s", listener.Addr())
+		}
 		go func() { serveErr <- server.Serve(listener) }()
 	}
 
@@ -284,9 +353,22 @@ func runStart(args []string) error {
 	// existing mapping does not open a window of 502s for the current URL.
 	if !opts.noServe && !serveConfigured {
 		if err := ts.SetRootProxy(ctx, target); err != nil {
+			if log != nil {
+				log.Logf("tailscale serve failed: %v", err)
+			}
 			return fmt.Errorf("configure tailscale serve: %w", err)
 		}
 		serveConfigured = true
+		if log != nil {
+			log.Logf("tailscale: serve / -> %s", target)
+		}
+	}
+	if log != nil {
+		if opts.noServe {
+			log.Logf("tailscale: serve not managed (--no-serve)")
+		} else if priorTarget != "" && priorTarget != target {
+			log.Logf("tailscale: replaced existing serve / -> %s (will restore on stop)", priorTarget)
+		}
 	}
 
 	// --- Persist run state (never the token) -------------------------------
@@ -310,8 +392,14 @@ func runStart(args []string) error {
 	}
 	if err := process.SaveState(state); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+		if log != nil {
+			log.Logf("state: could not be saved: %v", err)
+		}
 	} else {
 		stateSaved = true
+		if log != nil {
+			log.Logf("state: saved (proxy pid %d, dsh pid %d)", state.PID, state.DSHPID)
+		}
 	}
 
 	// --- Announce ----------------------------------------------------------
@@ -327,6 +415,9 @@ func runStart(args []string) error {
 		}
 	}
 	fmt.Fprintln(os.Stderr, "\nPress Ctrl+C to stop. DeepSeek Harness output follows.")
+	if log != nil {
+		log.Logf("ready: proxy on %s, dsh on %s", state.ProxyAddr, state.DSHAddr)
+	}
 
 	// --- Supervise ---------------------------------------------------------
 	sigCh := make(chan os.Signal, 1)
@@ -335,10 +426,15 @@ func runStart(args []string) error {
 
 	select {
 	case sig := <-sigCh:
+		exitReason = fmt.Sprintf("received %s", sig)
 		fmt.Fprintf(os.Stderr, "\ndsh-remote: received %s, shutting down\n", sig)
 		teardown()
 		return nil
 	case err := <-serveErr:
+		exitReason = "the stable proxy stopped"
+		if err != nil {
+			exitReason = fmt.Sprintf("the stable proxy stopped: %v", err)
+		}
 		teardown()
 		if err != nil {
 			return fmt.Errorf("stable proxy stopped unexpectedly: %w", err)
@@ -346,9 +442,42 @@ func runStart(args []string) error {
 		return errors.New("stable proxy stopped unexpectedly")
 	case <-proc.Done():
 		reason := dsh.ExitReason(proc.Err())
+		exitReason = "DeepSeek Harness " + reason
 		teardown()
 		return fmt.Errorf("DeepSeek Harness %s; stopping dsh-remote", reason)
 	}
+}
+
+// describeExit renders the supervise outcome for the log.
+func describeExit(reason string) string {
+	if reason == "" {
+		return "unknown (teardown ran without recording a reason)"
+	}
+	return reason
+}
+
+// serveMode renders whether Tailscale Serve is managed, for the log header.
+func serveMode(noServe bool) string {
+	if noServe {
+		return "not managed (--no-serve)"
+	}
+	return "managed"
+}
+
+// describeSpec renders how DeepSeek Harness will be launched, without any
+// credential: only the executable, the ports, and the trusted authorities.
+func describeSpec(spec dsh.Spec) string {
+	exec := spec.Exec
+	if exec == "" {
+		exec = "npx " + spec.Package
+	}
+	line := fmt.Sprintf("%s web --no-open --port %d", exec, spec.Port)
+	for _, host := range spec.TrustedHosts {
+		if host != "" {
+			line += " --trusted-host " + host
+		}
+	}
+	return line
 }
 
 // ensureServePermission applies one Serve root mapping, and when Tailscale
@@ -406,18 +535,27 @@ func printStartSummary(opts startOptions, tailnetHost, lanAddr string, dshPID in
 // restoreServe puts back the handler dsh-remote replaced, or explains why it
 // cannot safely remove the one it created. It never calls `tailscale serve
 // reset`, which would wipe unrelated Serve configuration.
-func restoreServe(ts *tailscale.Client, priorTarget string, proxyPort int) {
+func restoreServe(ts *tailscale.Client, priorTarget string, proxyPort int, log *logging.Logger) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if priorTarget != "" {
 		if err := ts.SetRootProxy(ctx, priorTarget); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not restore the previous tailscale serve mapping (%s); run `tailscale serve view` to check\n", priorTarget)
+			if log != nil {
+				log.Logf("tailscale: could not restore serve / -> %s: %v", priorTarget, err)
+			}
 		} else {
 			fmt.Fprintf(os.Stderr, "Restored tailscale serve / -> %s\n", priorTarget)
+			if log != nil {
+				log.Logf("tailscale: restored serve / -> %s", priorTarget)
+			}
 		}
 		return
 	}
 	fmt.Fprintf(os.Stderr, "note: tailscale serve still maps / to the now-stopped proxy on port %d.\n"+
 		"      dsh-remote will not run `tailscale serve reset` because that would wipe unrelated Serve config.\n"+
 		"      To remove just this mapping, use `tailscale serve set-config` or reset Serve deliberately.\n", proxyPort)
+	if log != nil {
+		log.Logf("tailscale: leaving existing serve mapping to the stopped proxy on port %d", proxyPort)
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tkoizumi/dsh-remote/internal/dsh"
 	"github.com/tkoizumi/dsh-remote/internal/process"
@@ -175,6 +176,9 @@ func renderStatus(d diagnose, opts statusOptions) string {
 
 	b.WriteString("\nSuggested action:\n")
 	b.WriteString(suggestionLines(d, sit, opts))
+
+	b.WriteString("\nDiagnostic log:\n")
+	b.WriteString(logSummaryLines(d))
 
 	b.WriteString("\nRemote DSH:\n")
 	if d.State != nil && d.State.RemoteURL != "" {
@@ -387,6 +391,61 @@ func suggestionLines(d diagnose, sit situation, opts statusOptions) string {
 		b.WriteString("If it is not managed by systemd, stop it and run `dsh-remote start` again.\n")
 	}
 	return b.String()
+}
+
+// logSummaryLines points at the persistent log and reports how recently it was
+// written. The timestamp is the point: after a crash the log is the only place
+// that says whether the proxy died a minute ago or has been down for hours.
+func logSummaryLines(d diagnose) string {
+	var b strings.Builder
+	log := d.Log
+	if log.Path == "" {
+		b.WriteString("unavailable (the state directory could not be resolved)\n")
+		return b.String()
+	}
+	if !log.Present {
+		fmt.Fprintf(&b, "%s (no file yet; it is created on the next start)\n", log.Path)
+		return b.String()
+	}
+	fmt.Fprintf(&b, "%s\n", log.Path)
+	fmt.Fprintf(&b, "size: %s, last written: %s\n", humanBytes(log.Size), humanAge(log.Modified))
+	if log.LastLine != "" {
+		fmt.Fprintf(&b, "last entry: %s\n", log.LastLine)
+	}
+	return b.String()
+}
+
+// humanBytes renders a byte count compactly.
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(n)/float64(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", float64(n)/float64(1<<10))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
+}
+
+// humanAge renders how long ago a timestamp was.
+func humanAge(t time.Time) string {
+	if t.IsZero() {
+		return "unknown"
+	}
+	age := time.Since(t)
+	if age < 0 {
+		age = 0
+	}
+	switch {
+	case age < time.Minute:
+		return fmt.Sprintf("%s ago", age.Round(time.Second))
+	case age < time.Hour:
+		return fmt.Sprintf("%s ago", age.Round(time.Minute))
+	case age < 48*time.Hour:
+		return fmt.Sprintf("%s ago", age.Round(time.Hour))
+	default:
+		return fmt.Sprintf("%s (%s ago)", t.Format("2006-01-02 15:04:05"), age.Round(24*time.Hour))
+	}
 }
 
 // lanAddress returns the LAN address recorded for the running proxy, if any.

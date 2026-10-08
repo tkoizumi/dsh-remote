@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/tkoizumi/dsh-remote/internal/dsh"
+	"github.com/tkoizumi/dsh-remote/internal/logging"
 	"github.com/tkoizumi/dsh-remote/internal/process"
 	"github.com/tkoizumi/dsh-remote/internal/proxy"
 	"github.com/tkoizumi/dsh-remote/internal/socket"
@@ -77,6 +78,9 @@ type diagnose struct {
 	// NoServe records that Serve management was explicitly declined, so a Serve
 	// mapping pointing elsewhere is intentional and is not reported as a fault.
 	NoServe bool
+	// Log describes the persistent lifecycle log, which is where an unexplained
+	// outage is explained after the fact.
+	Log logging.Status
 	// Supervision is the systemd state, which decides whether the proxy comes
 	// back without a human.
 	Supervision systemd.State
@@ -133,6 +137,12 @@ func runDiagnose(ctx context.Context, opts statusOptions) diagnose {
 	}
 
 	d.Tailnet, d.Serve, d.TailErr, d.TailNote = probeTailscale(ctx, state, opts.proxyPort)
+
+	// The persistent log is the forensic record: report where it is and how
+	// recently it was written.
+	if path, err := logging.Path(); err == nil {
+		d.Log = logging.Inspect(path)
+	}
 
 	// Supervision is the difference between an outage that heals and one that
 	// persists, so it is probed on every pass. It never touches systemd state.

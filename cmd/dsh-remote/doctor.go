@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/tkoizumi/dsh-remote/internal/dsh"
 	"github.com/tkoizumi/dsh-remote/internal/process"
@@ -92,6 +93,7 @@ func buildChecks(d diagnose, opts statusOptions) []check {
 	checks = append(checks, checkBootstrap(d, opts))
 	checks = append(checks, checkTailscale(d, opts))
 	checks = append(checks, checkSupervision(d))
+	checks = append(checks, checkLog(d))
 	checks = append(checks, checkOrphan(d, opts))
 	return checks
 }
@@ -328,6 +330,38 @@ func checkSupervision(d diagnose) check {
 			Status: checkWarn,
 			Detail: detail,
 			Advice: "run `systemctl --user start " + systemd.UnitName + "`",
+		}
+	}
+}
+
+// checkLog confirms the persistent log exists and says how old it is, because
+// that timestamp is what distinguishes "the proxy just died" from "it has been
+// down since yesterday" when the process is already gone.
+func checkLog(d diagnose) check {
+	switch {
+	case d.Log.Path == "":
+		return check{Name: "log", Status: checkWarn, Detail: "the state directory could not be resolved"}
+	case d.Log.Err != nil:
+		return check{Name: "log", Status: checkWarn, Detail: fmt.Sprintf("cannot read %s: %v", d.Log.Path, d.Log.Err)}
+	case !d.Log.Present:
+		return check{
+			Name:   "log",
+			Status: checkSkip,
+			Detail: fmt.Sprintf("no log yet at %s (created on the next start)", d.Log.Path),
+		}
+	case !d.Proxy.Healthy && time.Since(d.Log.Modified) > 6*time.Hour:
+		return check{
+			Name:   "log",
+			Status: checkWarn,
+			Detail: fmt.Sprintf("%s last written %s, which matches the outage window", d.Log.Path, humanAge(d.Log.Modified)),
+			Advice: "read it with: tail -n 100 " + d.Log.Path,
+		}
+	default:
+		return check{
+			Name:   "log",
+			Status: checkOK,
+			Detail: fmt.Sprintf("%s (%s, last written %s)", d.Log.Path, humanBytes(d.Log.Size), humanAge(d.Log.Modified)),
+			Advice: "inspect after a failure with: tail -n 100 " + d.Log.Path,
 		}
 	}
 }

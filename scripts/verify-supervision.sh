@@ -90,6 +90,30 @@ fi
 pass "$BIN present, systemd user bus reachable"
 
 # ---------------------------------------------------------------------------
+step "logs survive a restart"
+STATE_DIR="$(dirname "$(state_file)")"
+LOG_FILE="$STATE_DIR/dsh-remote.log"
+if [ -f "$LOG_FILE" ]; then
+  pass "persistent dsh-remote log at $LOG_FILE"
+  info "last entry: $(tail -n 1 "$LOG_FILE" 2>/dev/null)"
+else
+  warn "no dsh-remote log yet at $LOG_FILE"
+  info "it is created by the next \`$BIN start\`"
+fi
+
+# The journal is the systemd-level view (restart reasons, exit codes). It only
+# survives a reboot when /var/log/journal exists, because the default
+# Storage=auto keeps logs in /run otherwise.
+if [ -d /var/log/journal ]; then
+  pass "journald is persistent (/var/log/journal exists)"
+else
+  warn "journald is volatile on this host (no /var/log/journal)"
+  info "systemd's restart history will be lost on reboot. To keep it:"
+  info "  sudo mkdir -p /var/log/journal && sudo systemd-tmpfiles --create --prefix /var/log/journal && sudo systemctl restart systemd-journald"
+  info "dsh-remote's own log at $LOG_FILE is unaffected either way"
+fi
+
+# ---------------------------------------------------------------------------
 step "unit and restart policy"
 UNIT_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/${UNIT}"
 if [ ! -f "$UNIT_PATH" ]; then

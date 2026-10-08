@@ -187,3 +187,49 @@ func atoi(b []byte) int {
 	}
 	return n
 }
+
+// TestRedactingWriterResolvesTokenAtWriteTime is the property the persistent log
+// depends on: DeepSeek Harness prints its token-bearing line before the token has
+// been parsed, so redaction has to look the token up per write rather than
+// capture it once.
+func TestRedactingWriterResolvesTokenAtWriteTime(t *testing.T) {
+	const token = "ykUIFiyl2GcfrTIaUAth_iT7l_yZZkKhjvEABM6WxAo"
+	// The zero Process is unusable here: setToken closes the ready channel.
+	p := &Process{done: make(chan struct{}), token: make(chan struct{})}
+
+	var sink strings.Builder
+	writer := p.RedactingWriter(&sink)
+
+	// Before the token is known, only the shape-based pass can help; here the
+	// value is unknown, so the line is written unchanged and the logging
+	// package's backstop covers it.
+	if _, err := writer.Write([]byte("dsh web: http://127.0.0.1:3080/?token=" + token + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(sink.String(), token) {
+		t.Fatal("setup: expected the unknown-token line to pass through the value redactor")
+	}
+
+	// Once the token is known, every later write is redacted by value.
+	p.setToken(StartupToken{Token: token})
+	sink.Reset()
+	if _, err := writer.Write([]byte("relayed: token=" + token + " and again " + token + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(sink.String(), token) {
+		t.Fatalf("RedactingWriter leaked the token: %q", sink.String())
+	}
+	if !strings.Contains(sink.String(), RedactedMarker) {
+		t.Fatalf("RedactingWriter did not mark the redaction: %q", sink.String())
+	}
+}
+
+// TestRedactLineLeavesUnrelatedTextAlone guards against over-redaction.
+func TestRedactLineLeavesUnrelatedTextAlone(t *testing.T) {
+	if got := RedactLine("ordinary log output", "secret"); got != "ordinary log output" {
+		t.Fatalf("RedactLine altered unrelated text: %q", got)
+	}
+	if got := RedactLine("value secret here", ""); got != "value secret here" {
+		t.Fatalf("RedactLine with no known token altered text: %q", got)
+	}
+}

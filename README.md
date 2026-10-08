@@ -340,6 +340,60 @@ dsh-remote reconcile --no-start  # clean up only
 Both paths are safe to run repeatedly, and neither ever prints or moves the
 DeepSeek Harness token.
 
+### The persistent log
+
+Every run appends to a rotating log, so a failure can still be explained after
+the terminal is gone, the process is gone, and the machine has rebooted:
+
+```text
+~/.local/state/dsh-remote/dsh-remote.log        # mode 0600, 2 MiB, 2 rotations
+```
+
+`XDG_STATE_HOME` is honoured, and `DSH_REMOTE_STATE_FILE` moves the log next to
+whatever state file you point it at. Each line is timestamped, which is the point
+— whether the proxy died a minute ago or has been down for hours is written down:
+
+```text
+2026-10-08T13:26:49.371Z dsh-remote 0.1.0 starting: dsh port 3090, proxy port 3091, serve not managed (--no-serve)
+2026-10-08T13:26:49.375Z dsh: launching …/dsh web --no-open --port 3090
+2026-10-08T13:26:49.376Z dsh: started with pid 18
+2026-10-08T13:26:50.831Z dsh web: http://127.0.0.1:3090/?token=REDACTED
+2026-10-08T13:26:50.831Z ready: proxy on http://127.0.0.1:3091, dsh on http://127.0.0.1:3090
+2026-10-08T13:26:53.424Z dsh-remote 0.1.0 starting: dsh port 3090, proxy port 3091, serve not managed (--no-serve)
+2026-10-08T13:26:53.424Z preflight: stopping leftover DeepSeek Harness (pid 18) still holding port 3090 from an earlier run
+```
+
+Notice what the first run does **not** have: a `shutdown complete` line. That
+absence is the signature of an unclean exit, and it is how you tell a killed
+proxy from a stopped one without guessing. `status` and `doctor` always report
+the log's path, size, age, and last entry:
+
+```text
+Diagnostic log:
+/home/taka/.local/state/dsh-remote/dsh-remote.log
+size: 1.7 KiB, last written: 4s ago
+last entry: 2026-10-08T13:26:55.025Z ready: proxy on http://127.0.0.1:3081, dsh on http://127.0.0.1:3080
+```
+
+**The token is never written.** Two layers enforce that: the output relayed from
+DeepSeek Harness is redacted by value (the token is stripped as soon as it has
+been parsed), and every line logged also passes a shape-based backstop that
+catches `?token=…`, `Set-Cookie: …`, and `token: …`. `status` and `doctor` have a
+test asserting that neither prints a token, a cookie, or a token-bound redirect.
+
+This is separate from the systemd journal, which is the systemd-level view
+(restart reasons, exit codes, `Restart=` behaviour):
+
+```bash
+journalctl --user -u dsh-remote -n 200 --no-pager
+```
+
+The journal only survives a reboot when `/var/log/journal` exists, because
+journald's default `Storage=auto` keeps logs in `/run` otherwise — many Ubuntu
+and Debian images do not create that directory. The dsh-remote log above lives in
+the state directory, so it persists regardless. `scripts/verify-supervision.sh`
+checks both and tells you how to make the journal persistent if it is not.
+
 ### Verifying recovery on a real systemd host
 
 The repository ships an acceptance script for the P0 reliability properties —
@@ -539,6 +593,8 @@ The tests do not require a real DSH or Tailscale installation. They cover:
 - reclaiming an orphaned DSH on start, and refusing to touch one that
   dsh-remote did not launch,
 - the installed unit's restart policy and `--no-serve` intent,
+- the persistent log: timestamping, rotation, reopening across runs, and the
+  guarantee that neither a token nor a cookie value reaches the file,
 - `status` and `doctor` classification of the incident state, including a check
   that neither ever prints a token or cookie.
 
@@ -563,6 +619,7 @@ dsh-remote/
   internal/process/      port checks, liveness (including zombies), run state file
   internal/socket/       attribute a loopback port to the process holding it
   internal/systemd/      read-only supervision state for diagnostics
+  internal/logging/      rotating persistent log with credential redaction
   internal/lima/         Lima VM control for `dsh-remote vm`
   internal/qr/           terminal QR rendering
   scripts/               systemd acceptance test for the reliability properties
