@@ -21,9 +21,12 @@ const usageText = `dsh-remote - one stable Tailscale URL for a local DeepSeek Ha
 
 Usage:
   dsh-remote start     Launch DeepSeek Harness, the stable proxy, and Tailscale Serve
-  dsh-remote status    Report what is currently running
+  dsh-remote status    Report what is currently running, why, and how to fix it
+  dsh-remote doctor    Run end-to-end checks and print a verdict
+  dsh-remote reconcile Clear a leftover DeepSeek Harness and restore service
   dsh-remote stop      Stop the proxy and DeepSeek Harness, then restore Serve config
   dsh-remote qr        Print a QR code for the stable /dsh URL
+  dsh-remote vm        Run DeepSeek Harness in a Lima VM and serve it here
   dsh-remote install   Install a systemd user service that starts dsh-remote at login
   dsh-remote uninstall Remove that service
   dsh-remote version   Print the version
@@ -52,10 +55,16 @@ func run(args []string) error {
 		return runStart(rest)
 	case "status":
 		return runStatus(rest)
+	case "doctor":
+		return runDoctor(rest)
+	case "reconcile":
+		return runReconcile(rest)
 	case "stop":
 		return runStop(rest)
 	case "qr":
 		return runQR(rest)
+	case "vm":
+		return runVM(rest)
 	case "install":
 		return runInstall(rest)
 	case "uninstall":

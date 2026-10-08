@@ -116,12 +116,21 @@ func RemoveState() error {
 }
 
 // Alive reports whether the given pid names a live process.
+//
+// A zombie is not alive for our purposes. A killed child whose parent has not
+// reaped it still answers signal 0, but it holds no sockets and runs no code, so
+// treating it as alive makes `stop` wait out its timeout and makes `start`
+// refuse to launch against a port that is actually free. That matters most
+// exactly here: dsh-remote's own child is placed in its own process group and
+// can outlive its parent, so a reparented process can be left as a zombie.
 func Alive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || err == syscall.EPERM
+	if err := syscall.Kill(pid, 0); err != nil && err != syscall.EPERM {
+		return false
+	}
+	return !isZombie(pid)
 }
 
 // Terminate asks a pid to stop, escalating to SIGKILL after timeout. It is used

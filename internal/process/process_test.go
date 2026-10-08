@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -103,5 +104,56 @@ func TestAlive(t *testing.T) {
 	// A pid that cannot exist.
 	if Alive(1 << 30) {
 		t.Fatal("absurd pid reported alive")
+	}
+}
+
+// TestAliveRejectsZombie pins the distinction that makes cleanup terminate
+// promptly: a killed child whose parent has not reaped it still answers signal
+// 0, but it holds no sockets and must not keep `start` from launching.
+func TestAliveRejectsZombie(t *testing.T) {
+	root := t.TempDir()
+	pid := os.Getpid()
+	if err := os.MkdirAll(filepath.Join(root, strconv.Itoa(pid)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Format per proc(5): pid (comm) state ...
+	stat := strconv.Itoa(pid) + " (some worker (nested)) Z 1 2 3\n"
+	if err := os.WriteFile(filepath.Join(root, strconv.Itoa(pid), "stat"), []byte(stat), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	original := procRoot
+	procRoot = root
+	t.Cleanup(func() { procRoot = original })
+
+	if isZombie(pid) != true {
+		t.Fatal("isZombie did not recognise the Z state")
+	}
+	if Alive(pid) {
+		t.Fatal("Alive reported a zombie as alive")
+	}
+
+	// A living state must still read as alive.
+	stat = strconv.Itoa(pid) + " (dsh-remote) S 1 2 3\n"
+	if err := os.WriteFile(filepath.Join(root, strconv.Itoa(pid), "stat"), []byte(stat), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if isZombie(pid) {
+		t.Fatal("isZombie misread the S state")
+	}
+	if !Alive(pid) {
+		t.Fatal("Alive reported a sleeping process as dead")
+	}
+}
+
+// TestAliveTreatsUnreadableStatAsAlive keeps the conservative default: when the
+// state cannot be read, a signalable process is considered alive.
+func TestAliveTreatsUnreadableStatAsAlive(t *testing.T) {
+	original := procRoot
+	procRoot = filepath.Join(t.TempDir(), "missing")
+	t.Cleanup(func() { procRoot = original })
+
+	if !Alive(os.Getpid()) {
+		t.Fatal("Alive reported this process as dead when /proc was unreadable")
 	}
 }

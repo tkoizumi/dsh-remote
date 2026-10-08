@@ -115,6 +115,60 @@ default is no. With no terminal — for example under the systemd user service �
 `dsh-remote` never attempts an unattended `sudo`; it prints the command and
 exits nonzero instead.
 
+### One-time DeepSeek API key setup
+
+`dsh-remote` launches DeepSeek Harness; it does not hold a model credential
+itself. DeepSeek Harness resolves `DEEPSEEK_API_KEY` on its own, in one fixed
+order, and the file-based store is the layer to use here:
+
+| Source | Wins over | Persists across restart |
+| --- | --- | --- |
+| The environment you launched in (`DEEPSEEK_API_KEY=… dsh`) | everything | no — and it shadows every other layer |
+| The stored file `~/.dsh/.credentials.yaml` | both `.env` files | yes |
+| `<invocation cwd>/.env` | `~/.dsh/.env` | yes, but the directory is not fixed |
+| `~/.dsh/.env` | nothing | yes |
+
+Store the key once through the UI, which writes it to
+`~/.dsh/.credentials.yaml` (mode `0600`) under the reference
+`DEEPSEEK_API_KEY`:
+
+1. Start DeepSeek Harness and open the stable `/dsh` URL.
+2. Go to **Settings → Models** and open the **DeepSeek** card.
+3. Paste the key into **API key** and apply.
+
+The first-run dialog offers the same DeepSeek step, so a fresh machine can be
+set up without touching a terminal. A key saved there is used by the very next
+request — no restart and no configuration edit — which is what makes key
+rotation painless.
+
+**Why not a `.env` file.** It works, but it is the wrong layer for a service:
+
+- The *launch environment* is the highest-precedence source. A key exported in
+  your shell profile is not a durable answer: a systemd user service does not
+  read `~/.bashrc` or `~/.profile`, so the same machine behaves differently in
+  the foreground and at boot. When it does apply, it wins for that whole run,
+  cannot be overwritten from inside DeepSeek Harness, and makes the stored
+  reference read-only — so a key you rotate in the UI appears to be ignored.
+- A *project* `.env` is resolved from the invocation directory, and the unit
+  `dsh-remote` installs sets no `WorkingDirectory=`, so "where the service was
+  started" is not a stable place to keep a secret.
+- `~/.dsh/.env` does work and survives reboots, and is a fine way to bootstrap a
+  key before the first launch. It just loses to the stored file, which is
+  private, reloadable, and rotatable without editing text.
+
+Because the store is a file under the harness home, the key is read identically
+in the foreground and under `dsh-remote install` — there is no environment
+variable for a systemd unit to carry, and nothing for a reboot to lose. If
+DeepSeek Harness later reports `MISSING_CREDENTIAL`, the reference is
+unconfigured in every layer above; if it reports a key that is not the one you
+expected, check for a `DEEPSEEK_API_KEY` left in the service's environment.
+
+**In the Lima VM** the guest is a separate machine with its own harness home, so
+it needs its own key even when the Mac's is already configured. Set it the same
+way, from the guest: open `http://127.0.0.1:3081/dsh` and use the first-run
+DeepSeek step or **Settings → Models**. It is stored in the guest's
+`~/.dsh/.credentials.yaml` and survives VM restarts.
+
 ## Usage
 
 ```bash
@@ -144,9 +198,12 @@ the token redacted), and stops everything cleanly on Ctrl+C.
 | Command | What it does |
 | --- | --- |
 | `dsh-remote start` | Launch DSH, the stable proxy, and Tailscale Serve |
-| `dsh-remote status` | Report DSH, proxy, and Tailscale state |
+| `dsh-remote status` | Report DSH, proxy, and Tailscale state, why remote access is or is not available, and what to run next |
+| `dsh-remote doctor` | Run end-to-end checks (port, upstream, proxy, token, Serve, supervision, orphans) and print a verdict |
+| `dsh-remote reconcile` | Clear a leftover DeepSeek Harness that is holding the port, then start a fresh proxy |
 | `dsh-remote stop` | Stop DSH and the proxy, restore the previous Serve mapping |
 | `dsh-remote qr` | Print a QR code for the stable `/dsh` URL |
+| `dsh-remote vm` | Run DeepSeek Harness in a Lima VM and serve it on this Mac |
 | `dsh-remote install` | Install a systemd user service that starts at login/boot |
 | `dsh-remote uninstall` | Remove that service |
 
@@ -204,6 +261,155 @@ sudo loginctl enable-linger $USER
 After a reboot: Tailscale comes up, `dsh-remote` starts, it launches DSH,
 captures the **newly generated** token, and the same bookmarked `/dsh` URL
 works again.
+
+The DeepSeek credential is not part of this dance. Because it lives in
+`~/.dsh/.credentials.yaml` rather than in the service environment, the key
+survives reboots, `systemctl --user restart`, and unit regeneration by
+`install --force` with nothing extra to carry — see
+[One-time DeepSeek API key setup](#one-time-deepseek-api-key-setup).
+
+### When the proxy stops: supervision and leftover processes
+
+The stable URL works only while the proxy is listening. If the proxy exits — a
+closed terminal, a crash, a `SIGKILL` — both access paths stop at once, even
+though DeepSeek Harness may still be perfectly healthy.
+
+`dsh-remote install` is what makes that self-healing. The generated unit uses:
+
+```ini
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=3
+```
+
+`dsh-remote status` always states whether that supervision is actually in place,
+because a unit that is installed with `Restart=no`, or a user service without
+lingering, does not recover:
+
+```text
+Remote access: UNAVAILABLE
+
+Reason:
+The proxy is gone, but DeepSeek Harness (pid 118695) that dsh-remote launched is
+still holding port 3080. Both access paths go through the proxy, so the remote
+URL is unreachable.
+A plain restart would fail: port 3080 is already in use.
+
+Service supervision:
+systemd unit: not installed (/home/taka/.config/systemd/user/dsh-remote.service)
+no automatic restart is configured
+
+Suggested action:
+Install a supervised service so this cannot persist:
+    dsh-remote install --lan
+For unattended starts after reboot, also run:
+    sudo loginctl enable-linger $USER
+```
+
+That example is the failure mode worth understanding. DeepSeek Harness is started
+in its **own process group**, so that Ctrl+C and `stop` can signal the whole
+`npx` → `node` tree at once. The trade-off is that a proxy killed without a
+chance to run its cleanup handler leaves that child running. The orphan keeps
+port 3080, and every supervised restart then fails on the port conflict it
+creates.
+
+`start` handles this. Before launching anything it inspects the DeepSeek Harness
+port, and when the holder is a DeepSeek Harness that a previous `dsh-remote` run
+recorded in its own state file, it stops that process group and clears the stale
+state:
+
+```text
+dsh-remote: stopping leftover DeepSeek Harness (pid 118695) still holding port 3080 from an earlier run
+Starting DeepSeek Harness...
+```
+
+A DeepSeek Harness you started yourself — `dsh web` by hand, or on a port that
+was never recorded in the state file — is never touched. `start` refuses with a
+message telling you which pid holds the port instead.
+
+`dsh-remote reconcile` does the same cleanup on demand and then starts a fresh
+proxy. Use it when `status` names it:
+
+```bash
+dsh-remote reconcile          # asks before stopping anything
+dsh-remote reconcile --yes    # unattended
+dsh-remote reconcile --no-start  # clean up only
+```
+
+Both paths are safe to run repeatedly, and neither ever prints or moves the
+DeepSeek Harness token.
+
+### Verifying recovery on a real systemd host
+
+The repository ships an acceptance script for the P0 reliability properties —
+supervised restart, reboot recovery, and access without an interactive session:
+
+```bash
+scripts/verify-supervision.sh --no-reboot
+```
+
+It checks the unit and its restart policy, confirms the proxy and `/dsh`
+redirect, then `SIGKILL`s the proxy's own pid and verifies systemd brings it back
+and that no leftover DeepSeek Harness survives. Without `--no-reboot` it offers
+to reboot the machine; reconnect afterwards and re-run with `--no-reboot` to
+confirm the service came up on its own.
+
+### Running DeepSeek Harness in a VM (macOS)
+
+`dsh-remote vm` runs DeepSeek Harness inside a persistent
+[Lima](https://lima-vm.io) Linux VM on your Mac and serves the same stable `/dsh`
+URL on your Mac's loopback:
+
+```bash
+dsh-remote vm start
+```
+
+```text
+Open:  http://127.0.0.1:3081/dsh
+Shell: dsh-remote vm shell --name dsh
+Stop:  dsh-remote vm stop --name dsh
+```
+
+The first run creates the VM (this downloads an image and can take a few
+minutes), installs Node.js and DeepSeek Harness inside it, copies this
+`dsh-remote` binary in, and enables a systemd user service that runs
+`dsh-remote start --no-serve`. Lima forwards the guest's loopback ports to the
+host's loopback, so the URL is an ordinary `127.0.0.1` address and DeepSeek
+Harness trusts it without any extra configuration.
+
+| Command | What it does |
+| --- | --- |
+| `dsh-remote vm start` | Create or start the VM, install/refresh the service, report the URL |
+| `dsh-remote vm stop` | Stop DeepSeek Harness in the VM (`--vm` also shuts the VM down) |
+| `dsh-remote vm shell` | Open a shell (or run a command) in the VM |
+| `dsh-remote vm status` | Report the VM state and whether the URL is answering |
+
+`vm start` flags: `--name` (default `dsh`), `--cpus`, `--memory`, `--disk`,
+`--mount` (host directory shared writable, default `~/src`), `--config` (use
+your own Lima YAML), `--trusted-host` (repeatable), and `--proxy-port`.
+
+Requirements: macOS. If [Lima](https://lima-vm.io) is missing, `dsh-remote vm
+start` offers to run `brew install lima` on the terminal (the default is no);
+with no terminal it prints the command and exits instead of installing
+unattended. No Tailscale is installed or used inside the VM, and nothing in the
+VM is reachable from your network: the forward is guest loopback to Mac
+loopback.
+
+`examples/lima/dsh.yaml` is the same VM as a plain Lima config, for reading and
+hand-editing; point `vm start --config` at it if you prefer to own the file.
+
+To reach that VM from your phone, run Tailscale on the Mac (not in the VM) and
+point `tailscale serve` at the forwarded port. The browser then arrives under
+your Mac's tailnet name, so tell the VM to trust that authority:
+
+```bash
+dsh-remote vm start --trusted-host <your-mac>.ts.net
+tailscale serve --bg --yes --set-path=/ http://127.0.0.1:3081
+```
+
+Tailscale stays entirely on the Mac; the VM only learns the authority it must
+accept.
 
 ## Architecture
 
@@ -326,7 +532,15 @@ The tests do not require a real DSH or Tailscale installation. They cover:
 - WebSocket `101` upgrade passthrough,
 - a DSH child exiting unexpectedly,
 - signal and whole-process-group cleanup,
-- state-file round trips and the guarantee that no token is written.
+- state-file round trips and the guarantee that no token is written,
+- port attribution through `/proc` (own child vs. an unrelated holder),
+- zombie detection, so a killed-but-unreaped child does not stall `stop` or
+  block `start`,
+- reclaiming an orphaned DSH on start, and refusing to touch one that
+  dsh-remote did not launch,
+- the installed unit's restart policy and `--no-serve` intent,
+- `status` and `doctor` classification of the incident state, including a check
+  that neither ever prints a token or cookie.
 
 To smoke-test against a real DSH without Tailscale:
 
@@ -335,16 +549,23 @@ dsh-remote start --dsh-exec "$(command -v dsh)" --no-serve --no-qr
 curl -i http://127.0.0.1:3081/dsh
 ```
 
+For the systemd-side acceptance test, see
+[Verifying recovery on a real systemd host](#verifying-recovery-on-a-real-systemd-host).
+
 ## Repository layout
 
 ```text
 dsh-remote/
-  cmd/dsh-remote/        CLI: start, status, stop, qr, install
+  cmd/dsh-remote/        CLI: start, status, doctor, reconcile, stop, qr, vm, install
   internal/dsh/          launch DSH, parse the startup token
   internal/proxy/        stable loopback proxy and /dsh redirect
   internal/tailscale/    hostname detection and Serve management
-  internal/process/      port checks and the run state file
+  internal/process/      port checks, liveness (including zombies), run state file
+  internal/socket/       attribute a loopback port to the process holding it
+  internal/systemd/      read-only supervision state for diagnostics
+  internal/lima/         Lima VM control for `dsh-remote vm`
   internal/qr/           terminal QR rendering
+  scripts/               systemd acceptance test for the reliability properties
 ```
 
 ## License

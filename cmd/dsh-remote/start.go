@@ -77,10 +77,29 @@ func runStart(args []string) error {
 		return err
 	}
 
-	if existing, err := process.LoadState(); err != nil {
+	existing, err := process.LoadState()
+	if err != nil {
 		return err
-	} else if existing != nil && process.Alive(existing.PID) {
+	}
+	if existing != nil && process.Alive(existing.PID) {
 		return fmt.Errorf("dsh-remote is already running (pid %d); run `dsh-remote stop` first", existing.PID)
+	}
+
+	// Reclaim the DeepSeek Harness port before anything else. When the proxy is
+	// killed without running its cleanup, the child it launched keeps the port
+	// in its own process group; without this, every supervised restart would
+	// fail on the same port conflict and the outage would outlive the process
+	// that caused it. An unrelated `dsh web` is left strictly alone.
+	preflight, err := dshPortPreflight(opts.dshPort, existing, func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, "dsh-remote: "+format+"\n", args...)
+	})
+	if err != nil {
+		return err
+	}
+	if preflight == portReclaimed {
+		// The stale run state was removed with the orphan, so nothing below
+		// mistakes the dead proxy for a live one.
+		existing = nil
 	}
 
 	// --- Prerequisites -----------------------------------------------------
@@ -111,7 +130,9 @@ func runStart(args []string) error {
 	}
 
 	if err := process.PortAvailable(dsh.Loopback, opts.dshPort); err != nil {
-		return err
+		// dshPortPreflight already reclaimed or refused an attributable holder,
+		// so reaching here means the port is held by something else entirely.
+		return fmt.Errorf("%w (held by a process dsh-remote did not launch; free it or choose another port with --dsh-port)", err)
 	}
 	if err := process.PortAvailable(dsh.Loopback, opts.proxyPort); err != nil {
 		return err
@@ -225,7 +246,6 @@ func runStart(args []string) error {
 
 	// --- Launch DeepSeek Harness ------------------------------------------
 	fmt.Fprintln(os.Stderr, "Starting DeepSeek Harness...")
-	var err error
 	proc, err = dsh.Start(ctx, spec, os.Stderr)
 	if err != nil {
 		return err
