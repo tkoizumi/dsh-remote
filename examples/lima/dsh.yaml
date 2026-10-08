@@ -1,0 +1,21 @@
+base: template:_images/ubuntu
+
+cpus: 4
+memory: 8GiB
+disk: 60GiB
+
+mounts:
+  - location: "~/src"
+    writable: true
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y curl git
+      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+      apt-get install -y nodejs
+      npm install -g @deepseek-ai/dsh

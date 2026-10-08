@@ -19,6 +19,10 @@ func runInstall(args []string) error {
 	startNow := fs.Bool("start", true, "enable and start the service immediately")
 	lan := fs.Bool("lan", false, "have the service serve the stable URL on the local network too")
 	lanAddress := fs.String("lan-address", "", "local network address for --lan (default: detected)")
+	noServe := fs.Bool("no-serve", false, "have the service run without Tailscale Serve (use this in a VM)")
+	dshExec := fs.String("dsh-exec", "", "run this dsh executable instead of via npx")
+	var trustedHosts stringList
+	fs.Var(&trustedHosts, "trusted-host", "extra authority to pass to dsh --trusted-host (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -31,14 +35,8 @@ func runInstall(args []string) error {
 		executable = resolved
 	}
 
-	startFlags := ""
-	if *lan {
-		startFlags = " --lan"
-		if *lanAddress != "" {
-			startFlags += " --lan-address=" + *lanAddress
-		}
-	}
-	unit := renderUnit(executable, startFlags)
+	startFlags := installStartFlags(*lan, *lanAddress, *noServe, *dshExec, trustedHosts)
+	unit := renderUnit(executable, startFlags, *noServe)
 
 	var unitPath string
 	if *system {
@@ -82,9 +80,11 @@ func runInstall(args []string) error {
 
 	fmt.Println()
 	fmt.Println("Notes:")
-	fmt.Println("  - Tailscale Serve needs root or an operator. If dsh-remote reports")
-	fmt.Println("    'serve config denied', enable it once with:")
-	fmt.Println("        sudo tailscale set --operator=$USER")
+	if !*noServe {
+		fmt.Println("  - Tailscale Serve needs root or an operator. If dsh-remote reports")
+		fmt.Println("    'serve config denied', enable it once with:")
+		fmt.Println("        sudo tailscale set --operator=$USER")
+	}
 	if !*system {
 		fmt.Println("  - For the user service to start before you log in, run:")
 		fmt.Println("        sudo loginctl enable-linger $USER")
@@ -123,18 +123,53 @@ func runUninstall(args []string) error {
 	return nil
 }
 
-func renderUnit(executable, startFlags string) string {
+// installStartFlags renders the `start` flags the installed service should use.
+// It is separate from runInstall so the flag wiring is testable without
+// touching systemd or the filesystem.
+func installStartFlags(lan bool, lanAddress string, noServe bool, dshExec string, trustedHosts []string) string {
+	flags := ""
+	if lan {
+		flags += " --lan"
+		if lanAddress != "" {
+			flags += " --lan-address=" + systemdArg(lanAddress)
+		}
+	}
+	if noServe {
+		flags += " --no-serve"
+	}
+	if dshExec != "" {
+		flags += " --dsh-exec=" + systemdArg(dshExec)
+	}
+	for _, host := range trustedHosts {
+		flags += " --trusted-host=" + systemdArg(host)
+	}
+	return flags
+}
+
+func renderUnit(executable, startFlags string, noServe bool) string {
+	// A VM without Tailscale has no tailscaled.service, so do not order after it.
+	after := "network-online.target"
+	if !noServe {
+		after += " tailscaled.service"
+	}
+	// Record --no-serve in the environment as well as the command line, so a
+	// later `dsh-remote status` or `doctor` inside this unit can tell that Serve
+	// is deliberately unmanaged rather than broken.
+	noServeEnvLine := ""
+	if noServe {
+		noServeEnvLine = "\nEnvironment=" + noServeEnv + "=1"
+	}
 	return fmt.Sprintf(`[Unit]
-Description=dsh-remote: one stable Tailscale URL for DeepSeek Harness
+Description=dsh-remote: a stable /dsh URL for DeepSeek Harness
 Documentation=https://github.com/tkoizumi/dsh-remote
-After=network-online.target tailscaled.service
+After=%s
 Wants=network-online.target
 
 [Service]
 Type=simple
 # Capture the install-time PATH so npx (often installed outside /usr/bin) is
 # still resolvable under systemd's minimal environment.
-Environment=PATH=%s
+Environment=PATH=%s%s
 ExecStart=%s start%s
 Restart=on-failure
 RestartSec=3
@@ -142,7 +177,18 @@ TimeoutStopSec=25
 
 [Install]
 WantedBy=default.target
-`, os.Getenv("PATH"), systemdEscape(executable), startFlags)
+`, after, os.Getenv("PATH"), noServeEnvLine, systemdEscape(executable), startFlags)
+}
+
+// systemdArg quotes one ExecStart argument value when it contains characters
+// systemd would otherwise split or treat specially. The flag name stays
+// outside the quotes so `--flag=value` remains a single word.
+func systemdArg(value string) string {
+	if !strings.ContainsAny(value, " \t\"'\\%") {
+		return value
+	}
+	replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`, `%`, `%%`)
+	return `"` + replacer.Replace(value) + `"`
 }
 
 // systemdEscape quotes a path for an ExecStart= line.

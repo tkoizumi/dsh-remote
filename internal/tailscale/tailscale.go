@@ -30,7 +30,7 @@ type Client struct {
 func New() (*Client, error) {
 	path, err := exec.LookPath("tailscale")
 	if err != nil {
-		return nil, fmt.Errorf("tailscale not found in PATH: dsh-remote needs Tailscale to expose DeepSeek Harness to your tailnet (install and authenticate it first; see the README)")
+		return nil, fmt.Errorf("tailscale not found in PATH: dsh-remote needs Tailscale to expose DeepSeek Harness to your tailnet (install and authenticate it first, or pass --no-serve to run without Tailscale, for example inside a VM; see the README)")
 	}
 	return &Client{Bin: path}, nil
 }
