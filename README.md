@@ -216,6 +216,7 @@ Useful `start` flags:
 - `--no-serve` — manage only the local proxy; you configure Tailscale Serve yourself.
 - `--tailnet-host <name>` — override the detected Tailscale hostname.
 - `--trusted-host <authority>` — extra authority to pass to DSH (repeatable).
+- `--service <name>=<host:port>` — also expose another loopback dashboard (repeatable, see below).
 
 ### Local network access (no Tailscale on the client)
 
@@ -235,6 +236,28 @@ The first is for your phone (anywhere, via Tailscale). The second is for a
 browser on the same network — it needs no Tailscale at all. Both are served by
 this host, so both keep working when the other device is asleep.
 
+When `--lan-address` is not given, the address is chosen from the host's
+**default route**: the interface the kernel would use to reach the rest of the
+network. That is what makes a real LAN address win over a Docker bridge, a
+container veth, or a tunnel, which may sort first alphabetically. Loopback,
+link-local, Tailscale/CGNAT, `docker0`/`br-*`, `veth*`, `virbr*`, `vnet*`,
+`tun*`, `wg*`, `tailscale*`, and similar virtual interfaces are skipped; Wi-Fi,
+VLAN, bonded, and bridged LAN interfaces are kept. `--lan-address <ip>`
+overrides the choice entirely.
+
+The advertised endpoint is probed separately from the loopback proxy, because
+they are different sockets. `status` says whether the LAN address actually
+answers as the proxy, and flags a recorded address that only works locally — for
+example a stale `172.17.0.1` from an older build that bound the Docker bridge:
+
+```text
+Local network DSH (no Tailscale required):
+http://172.17.0.1:3081/dsh
+NOT a local network address: 172.17.0.1:3081 answers on this host but sits on an interface
+other LAN machines cannot reach (for example a Docker bridge)
+restart with `dsh-remote start --lan` to rebind to the default-route address
+```
+
 `--lan` binds only the named address, never `0.0.0.0`, and the address is added
 to DSH's `--trusted-host` list so the `/api` fence accepts it. To have the
 systemd service do this at boot:
@@ -244,6 +267,49 @@ dsh-remote install --lan
 ```
 
 **Read the security note below before using `--lan`.** It is off by default.
+
+### Serving another local dashboard alongside DSH
+
+`--service <name>=<host:port>` exposes a second loopback dashboard with the same
+two paths DSH gets: a plain-HTTP URL on the local network and an HTTPS URL on
+your tailnet. It is repeatable, and the backend must be loopback because
+Tailscale Serve proxies only to the local host.
+
+```bash
+dsh-remote start --lan --service hermes=127.0.0.1:9119
+```
+
+```text
+hermes backend: http://127.0.0.1:9119
+hermes remote URL: https://ubuntu-server.tail6d6db9.ts.net:8443/
+hermes local network URL: http://192.168.0.151:9119/
+```
+
+How it is wired:
+
+- **Tailnet** — each dashboard gets its own HTTPS port (`8443` then `10000`;
+  `443` stays DSH's) mounted at `/`, so the dashboard's own absolute asset URLs
+  keep working. On `stop`, a slot dsh-remote filled is cleared, and a slot it
+  replaced is restored.
+- **Local network** — with `--lan`, dsh-remote binds the detected LAN address on
+  the dashboard's own port and reverse-proxies to loopback, preserving the
+  `Host` header and streaming WebSockets/SSE. Like DSH's LAN listener, this is
+  plain HTTP and is opt-in: **the dashboard's own authentication is the only
+  thing protecting it.** A dashboard with no login (for example Hermes Agent,
+  which ships `__HERMES_AUTH_REQUIRED__=false`) is readable by anyone on the
+  network once `--lan` exposes it; over Tailscale it is at least gated by tailnet
+  identity and ACLs.
+- `status` and `doctor` report each service's two URLs and verify them
+  independently of the DSH proxy, since they are different sockets and different
+  backends.
+
+Unmanaged Serve is respected: with `--no-serve`, no tailnet mapping is touched
+and only the `--lan` URL is offered. To carry services into the supervised
+service:
+
+```bash
+dsh-remote install --lan --service hermes=127.0.0.1:9119
+```
 
 ### Surviving reboot
 
@@ -438,6 +504,35 @@ Both branches are deliberate, and both are covered by tests:
 
 `Restart=always` would restart on the second case too; `on-failure` is what keeps
 `stop` meaningful while still recovering every unexpected exit.
+
+### When the unit is inactive but a proxy is running
+
+A systemd unit that was stopped — or that exited after a signal — stays
+`inactive (dead)`. If someone then runs `dsh-remote start` by hand, that
+**unmanaged** instance owns the ports while systemd still reports the unit
+inactive. Nothing would restart it, and `systemctl --user start` is refused by
+`start`'s own guard ("dsh-remote is already running") until the manual instance
+is stopped. `systemctl --user status` and `dsh-remote status` therefore
+disagree unless you look at why.
+
+`dsh-remote` now makes the mismatch explicit instead of leaving it to be
+inferred:
+
+- `start` prints a note when a unit file exists but this run was not started by
+  systemd (systemd sets `INVOCATION_ID` for its own runs).
+- `status` and `doctor` warn when the unit is installed and inactive while a
+  proxy is running, and say how to hand it back:
+
+  ```text
+  warning: a proxy is running that systemd did not start; the unit is inactive,
+           so this instance will not be restarted automatically.
+           takeover with: dsh-remote stop && systemctl --user start dsh-remote.service
+  ```
+
+The two instances never actually run at once — the run-state guard prevents it —
+but the unmanaged one is invisible to systemd, which is the real hazard. Use
+`scripts/setup-supervision.sh`, which stops the foreground instance before
+enabling and starting the unit, to avoid the situation entirely.
 
 ### Running DeepSeek Harness in a VM (macOS)
 

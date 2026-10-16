@@ -53,6 +53,16 @@ func TestStateRoundTrip(t *testing.T) {
 		PriorServeTarget: "http://127.0.0.1:3080",
 		ServeConfigured:  true,
 		StartedAt:        time.Now().Truncate(time.Second),
+		Services: []ServiceState{{
+			Name:            "hermes",
+			Target:          "http://127.0.0.1:9119",
+			HTTPSPort:       8443,
+			Path:            "/",
+			TailnetURL:      "https://ubuntu-server.tail6d6db9.ts.net:8443/",
+			LANAddr:         "192.168.0.151",
+			LANURL:          "http://192.168.0.151:9119/",
+			ServeConfigured: true,
+		}},
 	}
 	if err := SaveState(want); err != nil {
 		t.Fatal(err)
@@ -67,6 +77,9 @@ func TestStateRoundTrip(t *testing.T) {
 	if got.PID != want.PID || got.DSHPID != want.DSHPID || got.RemoteURL != want.RemoteURL ||
 		got.PriorServeTarget != want.PriorServeTarget || !got.ServeConfigured {
 		t.Fatalf("round trip mismatch: got %+v want %+v", got, want)
+	}
+	if len(got.Services) != 1 || got.Services[0] != want.Services[0] {
+		t.Fatalf("service round trip mismatch: got %+v want %+v", got.Services, want.Services)
 	}
 
 	if err := RemoveState(); err != nil {

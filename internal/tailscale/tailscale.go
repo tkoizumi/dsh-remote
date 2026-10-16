@@ -1,6 +1,7 @@
 // Package tailscale talks to the local `tailscale` CLI. It detects this node's
-// MagicDNS name and manages exactly one Serve handler: the root path proxied to
-// dsh-remote. Tailscale Funnel is never used.
+// MagicDNS name and manages Serve handlers on the default HTTPS port (the root
+// path proxied to dsh-remote) and on dedicated HTTPS ports for extra local
+// dashboards. Tailscale Funnel is never used.
 package tailscale
 
 import (
@@ -9,10 +10,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"os/user"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -81,10 +84,10 @@ type serveStatus struct {
 	} `json:"Web"`
 }
 
-// RootTarget returns the proxy target currently mounted at "/", or "" when no
-// root handler is configured. It is used to record what we are about to
-// replace so `stop` can put it back.
-func (c *Client) RootTarget(ctx context.Context) (string, error) {
+// ServeTarget returns the proxy target mounted at path on the given HTTPS port,
+// or "" when nothing is mounted there. A non-proxy handler (static text or a
+// file) in that slot is reported as an error rather than silently replaced.
+func (c *Client) ServeTarget(ctx context.Context, port int, path string) (string, error) {
 	out, err := c.run(ctx, "serve", "status", "--json")
 	if err != nil {
 		return "", err
@@ -103,14 +106,24 @@ func (c *Client) RootTarget(ctx context.Context) (string, error) {
 	}
 	sort.Strings(hosts)
 	for _, host := range hosts {
-		if handler, ok := status.Web[host].Handlers["/"]; ok {
+		if servePortOf(host) != port {
+			continue
+		}
+		if handler, ok := status.Web[host].Handlers[path]; ok {
 			if handler.Proxy != "" {
 				return handler.Proxy, nil
 			}
-			return "", fmt.Errorf("tailscale serve already maps / on %s to something other than a proxy; dsh-remote will not overwrite it", host)
+			return "", fmt.Errorf("tailscale serve maps %s on port %d to something other than a proxy; dsh-remote will not overwrite it", path, port)
 		}
 	}
 	return "", nil
+}
+
+// RootTarget returns the proxy target currently mounted at "/" on the default
+// HTTPS port, or "" when no root handler is configured. It is used to record
+// what we are about to replace so `stop` can put it back.
+func (c *Client) RootTarget(ctx context.Context) (string, error) {
+	return c.ServeTarget(ctx, 443, "/")
 }
 
 // SetRootProxy mounts target at "/" for the default HTTPS port in the
@@ -121,6 +134,32 @@ func (c *Client) SetRootProxy(ctx context.Context, target string) error {
 		return err
 	}
 	return nil
+}
+
+// SetServeProxy mounts target at path on a specific HTTPS port in the
+// background, replacing any existing handler in that slot.
+func (c *Client) SetServeProxy(ctx context.Context, port int, path, target string) error {
+	_, err := c.run(ctx, "serve", "--bg", "--yes",
+		fmt.Sprintf("--https=%d", port), "--set-path="+path, target)
+	return err
+}
+
+// ClearServe removes the handler at path on the given HTTPS port. It is how a
+// service mapping that dsh-remote created is taken down on stop.
+func (c *Client) ClearServe(ctx context.Context, port int, path string) error {
+	_, err := c.run(ctx, "serve", fmt.Sprintf("--https=%d", port), "--set-path="+path, "off")
+	return err
+}
+
+// servePortOf reports the HTTPS port a `serve status --json` host key names. A
+// key with no port is the default HTTPS listener, 443.
+func servePortOf(host string) int {
+	if _, port, err := net.SplitHostPort(host); err == nil {
+		if n, err := strconv.Atoi(port); err == nil {
+			return n
+		}
+	}
+	return 443
 }
 
 // PermissionError marks a Serve configuration attempt that Tailscale refused

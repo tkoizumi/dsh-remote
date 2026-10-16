@@ -42,7 +42,7 @@ func runStop(args []string) error {
 		return nil
 	}
 
-	if process.Alive(start.PID) {
+	if start.ProxyAlive() {
 		fmt.Printf("Stopping dsh-remote (pid %d)...\n", start.PID)
 		if log != nil {
 			log.Logf("stopping proxy pid %d", start.PID)
@@ -56,7 +56,7 @@ func runStop(args []string) error {
 			log.Logf("state: recorded proxy pid %d was already gone", start.PID)
 		}
 	}
-	if start.DSHPID > 0 && process.Alive(start.DSHPID) {
+	if start.DSHAlive() {
 		fmt.Printf("Stopping leftover DeepSeek Harness (pid %d)...\n", start.DSHPID)
 		if log != nil {
 			log.Logf("stopping leftover dsh pid %d", start.DSHPID)
@@ -70,6 +70,7 @@ func runStop(args []string) error {
 		if remaining.ServeConfigured {
 			restoreServeOnStop(remaining.PriorServeTarget, *proxyPort, log)
 		}
+		restoreServiceServeOnStop(remaining.Services, log)
 		if err := process.RemoveState(); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not remove state file: %v\n", err)
 		} else if log != nil {
@@ -106,6 +107,31 @@ func restoreServeOnStop(priorTarget string, proxyPort int, log *logging.Logger) 
 	}
 	fmt.Fprintf(os.Stderr, "note: tailscale serve still maps / to the stopped proxy on port %d; "+
 		"remove it deliberately (dsh-remote never wipes unrelated Serve config)\n", proxyPort)
+}
+
+// restoreServiceServeOnStop clears or restores the Serve slots of extra
+// dashboards after an unclean proxy exit, when the proxy's own teardown could
+// not run.
+func restoreServiceServeOnStop(services []process.ServiceState, log *logging.Logger) {
+	var ts *tailscale.Client
+	for _, svc := range services {
+		if !svc.ServeConfigured || svc.HTTPSPort <= 0 {
+			continue
+		}
+		if ts == nil {
+			client, err := tailscale.New()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: cannot clean up tailscale serve for service %s: %v\n", svc.Name, err)
+				return
+			}
+			ts = client
+		}
+		path := svc.Path
+		if path == "" {
+			path = servicePath
+		}
+		restoreServeSlot(ts, svc.HTTPSPort, path, svc.PriorServeTarget, log)
+	}
 }
 
 func runQR(args []string) error {

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/tkoizumi/dsh-remote/internal/dsh"
-	"github.com/tkoizumi/dsh-remote/internal/process"
 	"github.com/tkoizumi/dsh-remote/internal/proxy"
 	"github.com/tkoizumi/dsh-remote/internal/systemd"
 )
@@ -91,6 +90,8 @@ func buildChecks(d diagnose, opts statusOptions) []check {
 	checks = append(checks, checkDSHCheck(d, opts)...)
 	checks = append(checks, checkProxy(d, opts)...)
 	checks = append(checks, checkBootstrap(d, opts))
+	checks = append(checks, checkLAN(d, opts))
+	checks = append(checks, checkServices(d)...)
 	checks = append(checks, checkTailscale(d, opts))
 	checks = append(checks, checkSupervision(d))
 	checks = append(checks, checkLog(d))
@@ -103,8 +104,10 @@ func checkRunState(d diagnose) checkStatus {
 		return checkSkip
 	}
 	// Stale state matters even while the proxy is healthy: it is what makes a
-	// later `start` refuse to launch after the next unclean exit.
-	if d.State.PID > 0 && !process.Alive(d.State.PID) {
+	// later `start` refuse to launch after the next unclean exit. ProxyAlive
+	// also catches the case a bare liveness check misses -- a pid that is alive
+	// but belongs to a different process, after a reboot or pid reuse.
+	if d.State.PID > 0 && !d.State.ProxyAlive() {
 		return checkWarn
 	}
 	if d.State.DSHPID > 0 && !d.DSH.Alive {
@@ -120,8 +123,8 @@ func runStateDetail(d diagnose) string {
 	detail := fmt.Sprintf("recorded proxy pid %d, DSH pid %d, started %s",
 		d.State.PID, d.State.DSHPID, d.State.StartedAt.Format("2006-01-02 15:04:05"))
 	switch {
-	case d.State.PID > 0 && !process.Alive(d.State.PID):
-		detail += "; the recorded proxy pid is not alive, so this state is stale"
+	case d.State.PID > 0 && !d.State.ProxyAlive():
+		detail += "; the recorded proxy pid is not the process that wrote this state, so this state is stale"
 	case d.State.DSHPID > 0 && !d.DSH.Alive:
 		detail += "; the recorded DSH pid is not alive, so this state is stale"
 	}
@@ -266,6 +269,143 @@ func checkBootstrap(d diagnose, opts statusOptions) check {
 	}
 }
 
+// checkLAN covers the local network endpoint. It is a separate listener from the
+// loopback proxy, so a healthy loopback answer proves nothing about it: the
+// advertised address can be stale, bound elsewhere, or the listener absent.
+func checkLAN(d diagnose, opts statusOptions) check {
+	switch {
+	case !d.LAN.Configured:
+		return check{Name: "local network", Status: checkSkip, Detail: "no local network endpoint is configured (start with --lan to add one)"}
+	case d.LAN.Loopback:
+		return check{
+			Name:   "local network",
+			Status: checkFail,
+			Detail: fmt.Sprintf("the recorded address %s is loopback, so no other machine can reach it", d.LAN.Addr),
+			Advice: "restart with `dsh-remote start --lan`, or pass a real --lan-address",
+		}
+	case d.LAN.NonLAN:
+		return check{
+			Name:   "local network",
+			Status: checkFail,
+			Detail: fmt.Sprintf("%s is not on an interface other LAN machines can reach (it may answer on this host, for example a Docker bridge)", d.LAN.Addr),
+			Advice: "restart with `dsh-remote start --lan` so the default-route address is used, or pass a reachable --lan-address",
+		}
+	case !d.LAN.Probed:
+		return check{Name: "local network", Status: checkSkip, Detail: "not probed: no usable LAN address was recorded"}
+	case d.LAN.IsProxy:
+		return check{
+			Name:   "local network",
+			Status: checkOK,
+			Detail: fmt.Sprintf("%s answers as the proxy (%s)", d.LAN.Addr, d.LAN.Status),
+		}
+	case d.LAN.Reachable:
+		return check{
+			Name:   "local network",
+			Status: checkWarn,
+			Detail: fmt.Sprintf("%s answered %s but not as the dsh-remote proxy", d.LAN.Addr, d.LAN.Status),
+		}
+	default:
+		return check{
+			Name:   "local network",
+			Status: checkFail,
+			Detail: fmt.Sprintf("%s is not reachable from this host: %v", d.LAN.Addr, d.LAN.Err),
+			Advice: "ensure the proxy is bound to the LAN address; restart with `dsh-remote start --lan`",
+		}
+	}
+}
+
+// checkServices reports one check per extra dashboard. Each has its own backend
+// and listener, so it is verified independently of DSH.
+func checkServices(d diagnose) []check {
+	var checks []check
+	for _, svc := range d.Services {
+		c := check{Name: "service " + svc.Name, Status: checkOK}
+		var parts []string
+
+		if svc.TailnetURL != "" {
+			switch {
+			case svc.TailServeErr != nil:
+				c.Status = worst(c.Status, checkWarn)
+				parts = append(parts, fmt.Sprintf("tailnet mapping could not be checked: %v", svc.TailServeErr))
+			case svc.TailServeTarget == "":
+				c.Status = worst(c.Status, checkFail)
+				parts = append(parts, fmt.Sprintf("no Serve mapping on port %d, so %s is unreachable over Tailscale", svc.HTTPSPort, svc.TailnetURL))
+				c.Advice = "restart with `dsh-remote start --service " + svc.Name + "=" + serviceFlagArg(svc.Target) + "`"
+			case svc.TailServeTarget != svc.Target:
+				c.Status = worst(c.Status, checkWarn)
+				parts = append(parts, fmt.Sprintf("port %d is mapped to %s, not %s", svc.HTTPSPort, svc.TailServeTarget, svc.Target))
+			default:
+				parts = append(parts, "tailnet: "+svc.TailnetURL)
+			}
+		}
+
+		// A dead backend explains a failing LAN probe, so report it once as the
+		// root cause rather than twice.
+		backendDown := svc.BackendProbed && !svc.BackendReachable
+
+		if svc.LANURL != "" {
+			switch {
+			case svc.LANNonLAN:
+				c.Status = worst(c.Status, checkFail)
+				parts = append(parts, fmt.Sprintf("local network %s is not on a LAN-reachable interface", svc.LANURL))
+				if c.Advice == "" {
+					c.Advice = "restart with `dsh-remote start --lan --service " + svc.Name + "=" + serviceFlagArg(svc.Target) + "`"
+				}
+			case svc.LANProbed && svc.LANReachable:
+				parts = append(parts, "local network: "+svc.LANURL)
+			case svc.LANProbed && !backendDown:
+				c.Status = worst(c.Status, checkFail)
+				parts = append(parts, fmt.Sprintf("local network %s is not reachable: %v", svc.LANURL, svc.LANErr))
+				if c.Advice == "" {
+					c.Advice = "restart with `dsh-remote start --lan --service " + svc.Name + "=" + serviceFlagArg(svc.Target) + "`"
+				}
+			}
+		}
+
+		if backendDown {
+			c.Status = worst(c.Status, checkFail)
+			detail := fmt.Sprintf("backend %s is not reachable", svc.Target)
+			if svc.BackendErr != nil {
+				detail += ": " + svc.BackendErr.Error()
+			}
+			parts = append(parts, detail)
+			if c.Advice == "" {
+				c.Advice = "start the dashboard so it listens on " + serviceFlagArg(svc.Target)
+			}
+		}
+
+		if len(parts) == 0 {
+			c.Status = checkSkip
+			parts = append(parts, "no URL is recorded for this service")
+		}
+		c.Detail = strings.Join(parts, "; ")
+		checks = append(checks, c)
+	}
+	return checks
+}
+
+// worst returns the more severe of two check statuses.
+func worst(a, b checkStatus) checkStatus {
+	if checkSeverity(b) > checkSeverity(a) {
+		return b
+	}
+	return a
+}
+
+// checkSeverity orders statuses by how much they should worry an operator.
+func checkSeverity(s checkStatus) int {
+	switch s {
+	case checkFail:
+		return 3
+	case checkWarn:
+		return 2
+	case checkSkip:
+		return 1
+	default:
+		return 0
+	}
+}
+
 // checkTailscale confirms the tailnet identity and the Serve root mapping.
 func checkTailscale(d diagnose, opts statusOptions) check {
 	if d.TailErr != nil {
@@ -322,14 +462,19 @@ func checkSupervision(d diagnose) check {
 		}
 	default:
 		detail := "unit installed but not active"
+		advice := "run `systemctl --user start " + systemd.UnitName + "`"
 		if !sd.CanRecover() {
 			detail = fmt.Sprintf("unit installed with Restart=%s, which will not recover every exit", orUnknown(sd.Restart))
+		}
+		if supervisedInstanceRunning(d, sd) {
+			detail = "unit is inactive while a proxy runs outside systemd, so nothing would restart it"
+			advice = "stop the manual instance, then start the service: dsh-remote stop && systemctl --user start " + systemd.UnitName
 		}
 		return check{
 			Name:   "supervision",
 			Status: checkWarn,
 			Detail: detail,
-			Advice: "run `systemctl --user start " + systemd.UnitName + "`",
+			Advice: advice,
 		}
 	}
 }

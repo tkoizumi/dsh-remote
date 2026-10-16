@@ -43,6 +43,39 @@ type State struct {
 	ServeConfigured  bool      `json:"serveConfigured,omitempty"`
 	Version          string    `json:"version,omitempty"`
 	StartedAt        time.Time `json:"startedAt"`
+	// BootID, ProxyStart and DSHStart make the recorded pids verifiable. A bare
+	// pid can be reused after a reboot or pid wraparound, and mistaking a
+	// stranger for "the run I started" wedges start until the state file is
+	// removed by hand. See identity.go.
+	BootID     string `json:"bootId,omitempty"`
+	ProxyStart int64  `json:"proxyStart,omitempty"`
+	DSHStart   int64  `json:"dshStart,omitempty"`
+	// Services are additional loopback dashboards exposed alongside DSH. They
+	// carry their own Serve slot so an unclean exit can still be cleaned up.
+	Services []ServiceState `json:"services,omitempty"`
+}
+
+// ServiceState is one extra dashboard dsh-remote exposes. Target is the loopback
+// URL it forwards and proxies to; the two URLs are what a user opens.
+type ServiceState struct {
+	Name string `json:"name"`
+	// Target is the loopback backend, for example http://127.0.0.1:9119.
+	Target string `json:"target"`
+	// HTTPSPort is the Tailscale Serve HTTPS port carrying this service, for
+	// example 8443. Zero when Serve was not managed for it.
+	HTTPSPort int `json:"httpsPort,omitempty"`
+	// Path is the Serve mount point, currently always "/" so the dashboard's
+	// absolute asset URLs keep working.
+	Path string `json:"path,omitempty"`
+	// TailnetURL is the browser URL reachable over Tailscale.
+	TailnetURL string `json:"tailnetUrl,omitempty"`
+	// LANAddr and LANURL describe the plain-HTTP listener on the local network.
+	LANAddr string `json:"lanAddr,omitempty"`
+	LANURL  string `json:"lanUrl,omitempty"`
+	// PriorServeTarget is what occupied the Serve slot before dsh-remote, so it
+	// can be restored on stop.
+	PriorServeTarget string `json:"priorServeTarget,omitempty"`
+	ServeConfigured  bool   `json:"serveConfigured,omitempty"`
 }
 
 // StatePath returns the state file location, honouring XDG_STATE_HOME and

@@ -98,3 +98,76 @@ func TestSetRootProxyPassesExpectedArgs(t *testing.T) {
 		t.Fatalf("args = %q, want %q", got, want)
 	}
 }
+
+// TestServeTargetReadsExtraPort covers the second HTTPS port an extra dashboard
+// uses, and proves the default-port reader does not mistake it for the root.
+func TestServeTargetReadsExtraPort(t *testing.T) {
+	client := fakeCLI(t, `echo '{"Web":{"host.ts.net:8443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9119"}}},"host.ts.net":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3081"}}}}}'`)
+
+	got, err := client.ServeTarget(context.Background(), 8443, "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "http://127.0.0.1:9119" {
+		t.Fatalf("ServeTarget(8443) = %q, want http://127.0.0.1:9119", got)
+	}
+
+	root, err := client.RootTarget(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root != "http://127.0.0.1:3081" {
+		t.Fatalf("RootTarget = %q, want the 443 handler", root)
+	}
+
+	if empty, err := client.ServeTarget(context.Background(), 10000, "/"); err != nil || empty != "" {
+		t.Fatalf("ServeTarget(10000) = (%q, %v), want empty", empty, err)
+	}
+}
+
+// TestServeTargetTreatsUnlabelledHostAs443 matches how `serve status --json`
+// omits the port for the default HTTPS listener.
+func TestServeTargetTreatsUnlabelledHostAs443(t *testing.T) {
+	client := fakeCLI(t, `echo '{"Web":{"host.ts.net":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3081"}}}}}'`)
+	got, err := client.ServeTarget(context.Background(), 443, "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "http://127.0.0.1:3081" {
+		t.Fatalf("ServeTarget(443) = %q, want http://127.0.0.1:3081", got)
+	}
+}
+
+func TestSetServeProxyPassesExpectedArgs(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args")
+	client := fakeCLI(t, `echo "$@" > `+argsFile)
+	if err := client.SetServeProxy(context.Background(), 8443, "/", "http://127.0.0.1:9119"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.TrimSpace(string(data))
+	want := "serve --bg --yes --https=8443 --set-path=/ http://127.0.0.1:9119"
+	if got != want {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
+func TestClearServePassesExpectedArgs(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args")
+	client := fakeCLI(t, `echo "$@" > `+argsFile)
+	if err := client.ClearServe(context.Background(), 8443, "/"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.TrimSpace(string(data))
+	want := "serve --https=8443 --set-path=/ off"
+	if got != want {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+}

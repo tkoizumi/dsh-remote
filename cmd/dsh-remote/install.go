@@ -23,6 +23,8 @@ func runInstall(args []string) error {
 	dshExec := fs.String("dsh-exec", "", "run this dsh executable instead of via npx")
 	var trustedHosts stringList
 	fs.Var(&trustedHosts, "trusted-host", "extra authority to pass to dsh --trusted-host (repeatable)")
+	var services stringList
+	fs.Var(&services, "service", "also expose a loopback dashboard (repeatable): name=host:port")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -35,7 +37,7 @@ func runInstall(args []string) error {
 		executable = resolved
 	}
 
-	startFlags := installStartFlags(*lan, *lanAddress, *noServe, *dshExec, trustedHosts)
+	startFlags := installStartFlags(*lan, *lanAddress, *noServe, *dshExec, trustedHosts, services)
 	unit := renderUnit(executable, startFlags, *noServe)
 
 	var unitPath string
@@ -126,7 +128,7 @@ func runUninstall(args []string) error {
 // installStartFlags renders the `start` flags the installed service should use.
 // It is separate from runInstall so the flag wiring is testable without
 // touching systemd or the filesystem.
-func installStartFlags(lan bool, lanAddress string, noServe bool, dshExec string, trustedHosts []string) string {
+func installStartFlags(lan bool, lanAddress string, noServe bool, dshExec string, trustedHosts []string, services []string) string {
 	flags := ""
 	if lan {
 		flags += " --lan"
@@ -142,6 +144,9 @@ func installStartFlags(lan bool, lanAddress string, noServe bool, dshExec string
 	}
 	for _, host := range trustedHosts {
 		flags += " --trusted-host=" + systemdArg(host)
+	}
+	for _, service := range services {
+		flags += " --service=" + systemdArg(service)
 	}
 	return flags
 }
@@ -164,6 +169,14 @@ Description=dsh-remote: a stable /dsh URL for DeepSeek Harness
 Documentation=https://github.com/tkoizumi/dsh-remote
 After=%s
 Wants=network-online.target
+# Bound the restart loop. RestartSec=3 spaces attempts about 3s apart, which
+# slips under systemd's default limit of 5 starts per 10s -- so a conflict the
+# service can never clear (a foreign process holding the port, say) retried for
+# hours: one incident logged 2841 restarts and 2.7 hours of outage. Five
+# attempts across five minutes still rides out a transient failure, then leaves
+# a failed unit a human can actually see and fix.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple

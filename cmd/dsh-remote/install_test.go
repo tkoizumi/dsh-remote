@@ -6,26 +6,26 @@ import (
 )
 
 func TestInstallStartFlagsNoServe(t *testing.T) {
-	if got := installStartFlags(false, "", true, "", nil); got != " --no-serve" {
+	if got := installStartFlags(false, "", true, "", nil, nil); got != " --no-serve" {
 		t.Fatalf("installStartFlags = %q, want %q", got, " --no-serve")
 	}
 }
 
 func TestInstallStartFlagsDshExec(t *testing.T) {
-	if got := installStartFlags(false, "", false, "/usr/bin/dsh", nil); got != " --dsh-exec=/usr/bin/dsh" {
+	if got := installStartFlags(false, "", false, "/usr/bin/dsh", nil, nil); got != " --dsh-exec=/usr/bin/dsh" {
 		t.Fatalf("installStartFlags = %q", got)
 	}
 }
 
 func TestInstallStartFlagsTrustedHosts(t *testing.T) {
-	got := installStartFlags(false, "", true, "", []string{"mac.ts.net", "192.168.64.5"})
+	got := installStartFlags(false, "", true, "", []string{"mac.ts.net", "192.168.64.5"}, nil)
 	if want := " --no-serve --trusted-host=mac.ts.net --trusted-host=192.168.64.5"; got != want {
 		t.Fatalf("installStartFlags = %q, want %q", got, want)
 	}
 }
 
 func TestInstallStartFlagsCombines(t *testing.T) {
-	got := installStartFlags(true, "192.168.64.5", true, "/usr/bin/dsh", nil)
+	got := installStartFlags(true, "192.168.64.5", true, "/usr/bin/dsh", nil, nil)
 	for _, want := range []string{" --lan", " --lan-address=192.168.64.5", " --no-serve", " --dsh-exec=/usr/bin/dsh"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("installStartFlags = %q, missing %q", got, want)
@@ -34,7 +34,7 @@ func TestInstallStartFlagsCombines(t *testing.T) {
 }
 
 func TestInstallStartFlagsQuotesDSHExecWithSpaces(t *testing.T) {
-	got := installStartFlags(false, "", false, "/opt/my tools/dsh", nil)
+	got := installStartFlags(false, "", false, "/opt/my tools/dsh", nil, nil)
 	if want := ` --dsh-exec="/opt/my tools/dsh"`; got != want {
 		t.Fatalf("installStartFlags = %q, want %q", got, want)
 	}
@@ -77,6 +77,20 @@ func TestRenderUnitRestartPolicy(t *testing.T) {
 	// Type=simple with a service that exits non-zero is what makes Restart work.
 	if !strings.Contains(unit, "Type=simple") {
 		t.Errorf("unit is missing Type=simple:\n%s", unit)
+	}
+}
+
+// TestRenderUnitBoundsRestarts is the other half of the restart policy. A start
+// that can never succeed must not be retried forever: RestartSec=3 spaces
+// attempts about 3s apart, which slips under systemd's default limit of 5
+// starts per 10s, and one incident logged 2841 restarts over 2.7 hours because
+// of it. An explicit, wider limit turns that into a failed unit a human can see.
+func TestRenderUnitBoundsRestarts(t *testing.T) {
+	unit := renderUnit("/usr/local/bin/dsh-remote", "", false)
+	for _, want := range []string{"StartLimitIntervalSec=", "StartLimitBurst="} {
+		if !strings.Contains(unit, want) {
+			t.Errorf("unit is missing %q, so a permanent port conflict would retry forever:\n%s", want, unit)
+		}
 	}
 }
 

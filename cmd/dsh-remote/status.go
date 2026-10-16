@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/tkoizumi/dsh-remote/internal/dsh"
-	"github.com/tkoizumi/dsh-remote/internal/process"
 	"github.com/tkoizumi/dsh-remote/internal/proxy"
 	"github.com/tkoizumi/dsh-remote/internal/systemd"
 )
@@ -191,8 +190,101 @@ func renderStatus(d diagnose, opts statusOptions) string {
 	if d.State != nil && d.State.LANURL != "" {
 		b.WriteString("\nLocal network DSH (no Tailscale required):\n")
 		fmt.Fprintf(&b, "%s\n", d.State.LANURL)
+		b.WriteString(lanReachabilityLine(d))
+	}
+	if len(d.Services) > 0 {
+		b.WriteString("\nLocal services:\n")
+		for _, svc := range d.Services {
+			fmt.Fprintf(&b, "%s:\n", svc.Name)
+			if svc.TailnetURL != "" {
+				fmt.Fprintf(&b, "  tailscale: %s\n", svc.TailnetURL)
+				b.WriteString(serviceTailLine(svc))
+			}
+			if svc.LANURL != "" {
+				fmt.Fprintf(&b, "  local network: %s\n", svc.LANURL)
+				b.WriteString(serviceLANLine(svc))
+			}
+			if svc.BackendProbed && !svc.BackendReachable {
+				b.WriteString(serviceBackendLine(svc))
+			}
+		}
 	}
 	return b.String()
+}
+
+// serviceBackendLine reports that the dashboard process itself is down, which is
+// the cause of a 502 or empty page on every URL.
+func serviceBackendLine(svc serviceProbe) string {
+	detail := "not reachable"
+	if svc.BackendErr != nil {
+		detail = "not reachable: " + svc.BackendErr.Error()
+	}
+	return fmt.Sprintf("  backend %s: %s\n", svc.Target, detail)
+}
+
+// serviceTailLine says whether the tailnet URL for a service is actually
+// mounted, which is separate from whether the local backend is up.
+func serviceTailLine(svc serviceProbe) string {
+	switch {
+	case svc.TailServeErr != nil:
+		return fmt.Sprintf("  tailscale mapping: could not be checked: %v\n", svc.TailServeErr)
+	case svc.TailServeTarget == "":
+		return fmt.Sprintf("  tailscale mapping: MISSING (nothing is mounted on port %d)\n", svc.HTTPSPort)
+	case svc.TailServeTarget != svc.Target:
+		return fmt.Sprintf("  tailscale mapping: points to %s, not %s\n", svc.TailServeTarget, svc.Target)
+	default:
+		return "  tailscale mapping: ok\n"
+	}
+}
+
+// serviceLANLine says whether the plain-HTTP local network URL for a service
+// answers, and calls out an address other LAN machines cannot route to.
+func serviceLANLine(svc serviceProbe) string {
+	switch {
+	case svc.LANNonLAN:
+		return "  local network: NOT a LAN-reachable address (for example a Docker bridge)\n"
+	case svc.LANProbed && svc.LANReachable:
+		return fmt.Sprintf("  local network: reachable (%s)\n", svc.LANStatus)
+	case svc.LANProbed && svc.LANErr != nil:
+		return fmt.Sprintf("  local network: NOT reachable: %v\n", svc.LANErr)
+	default:
+		return ""
+	}
+}
+
+// lanReachabilityLine states whether the advertised local network URL is
+// actually served. The loopback health check cannot answer this: the LAN
+// listener is a different socket, and after a network change the recorded
+// address can be stale even while the loopback proxy is perfectly healthy.
+func lanReachabilityLine(d diagnose) string {
+	switch {
+	case d.LAN.Loopback:
+		return "NOT usable: the recorded address is loopback, so other machines cannot open it\n" +
+			"restart with `dsh-remote start --lan` (or pass a real --lan-address)\n"
+	case d.LAN.NonLAN:
+		if d.LAN.Reachable {
+			return fmt.Sprintf("NOT a local network address: %s answers on this host but sits on an interface\n"+
+				"other LAN machines cannot reach (for example a Docker bridge)\n"+
+				"restart with `dsh-remote start --lan` to rebind to the default-route address\n", d.LAN.Addr)
+		}
+		return fmt.Sprintf("NOT a local network address: %s is not on an interface other LAN machines can reach\n", d.LAN.Addr)
+	case !d.LAN.Probed:
+		// No verifiable claim when no probe ran.
+		return ""
+	case d.LAN.IsProxy:
+		return "reachable from this host on the LAN address (answered as the dsh-remote proxy)\n"
+	case d.LAN.Reachable:
+		return fmt.Sprintf("something is listening on %s but did not answer as the dsh-remote proxy (%s)\n",
+			d.LAN.Addr, d.LAN.Status)
+	default:
+		detail := ""
+		if d.LAN.Err != nil {
+			detail = ": " + d.LAN.Err.Error()
+		}
+		return fmt.Sprintf("NOT reachable from this host on %s%s\n"+
+			"the proxy may be bound to loopback only, or the recorded address may be stale\n",
+			d.LAN.Addr, detail)
+	}
 }
 
 // dshStatusText renders the DSH section heading.
@@ -256,11 +348,11 @@ func proxyNoteLines(d diagnose) []string {
 	if d.State == nil || d.State.PID <= 0 || d.Proxy.Healthy {
 		return nil
 	}
-	if process.Alive(d.State.PID) {
+	if d.State.ProxyAlive() {
 		return nil
 	}
 	return []string{fmt.Sprintf(
-		"note: run state still names proxy pid %d, which is not alive; the state file is stale",
+		"note: run state still names proxy pid %d, which is not the process that wrote it; the state file is stale",
 		d.State.PID)}
 }
 
@@ -298,10 +390,27 @@ func supervisionLines(d diagnose, sit situation) string {
 	if sd.Err != nil {
 		fmt.Fprintf(&b, "note: could not query systemd: %v\n", sd.Err)
 	}
+	if supervisedInstanceRunning(d, sd) {
+		b.WriteString("warning: a proxy is running that systemd did not start; the unit is inactive,\n")
+		b.WriteString("         so this instance will not be restarted automatically.\n")
+		b.WriteString("         takeover with: dsh-remote stop && systemctl --user start " + systemd.UnitName + "\n")
+	}
 	if !sd.CanRecover() && sit != situationHealthy {
 		b.WriteString("no automatic recovery is available for the current state\n")
 	}
 	return b.String()
+}
+
+// supervisedInstanceRunning reports the lifecycle mismatch behind the reported
+// observation that the unit is "inactive (dead)" while a proxy is running.
+// systemd has no knowledge of a manually started instance, so an outage will not
+// recover; and `systemctl --user start` is refused by the run-state guard until
+// that instance is stopped, which is why the two cannot simply coexist.
+func supervisedInstanceRunning(d diagnose, sd systemd.State) bool {
+	if !sd.Supported || !sd.Installed || sd.Active {
+		return false
+	}
+	return d.Proxy.Listening || d.Proxy.Healthy || (d.State != nil && d.State.ProxyAlive())
 }
 
 // reasonLine explains the classified outage in one or two lines.
@@ -310,6 +419,17 @@ func reasonLine(d diagnose, sit situation, opts statusOptions) string {
 	switch sit {
 	case situationHealthy:
 		b.WriteString("The proxy is listening and its upstream is reachable.\n")
+		if d.LAN.Configured && d.LAN.Probed && !d.LAN.Reachable {
+			b.WriteString("The local network endpoint is NOT reachable, so clients that arrive without\n")
+			b.WriteString("Tailscale cannot connect.\n")
+		}
+		if d.LAN.NonLAN {
+			b.WriteString("The recorded local network address is not on a LAN-reachable interface, so other\n")
+			b.WriteString("machines cannot connect even though this host can.\n")
+		}
+		if d.LAN.Loopback {
+			b.WriteString("The recorded local network address is loopback, so it cannot serve the LAN.\n")
+		}
 	case situationProxyDown:
 		fmt.Fprintf(&b, "The proxy is not listening on port %d.\n", opts.proxyPort)
 		if d.DSH.Listening {
@@ -345,6 +465,11 @@ func suggestionLines(d diagnose, sit situation, opts statusOptions) string {
 	var b strings.Builder
 	switch sit {
 	case situationHealthy:
+		if d.LAN.NonLAN || (d.LAN.Configured && d.LAN.Probed && !d.LAN.Reachable) {
+			b.WriteString("Restart the proxy so it binds the local network address again:\n")
+			b.WriteString("    dsh-remote stop && dsh-remote start --lan\n")
+			break
+		}
 		b.WriteString("None required.\n")
 	case situationOrphaned:
 		b.WriteString("Run this to clear the leftover DeepSeek Harness and start a supervised proxy:\n")

@@ -14,6 +14,11 @@ import (
 // cleanly before it is killed outright.
 const orphanStopTimeout = 10 * time.Second
 
+// portReleaseTimeout is how long a reclaimed port is given to disappear from the
+// kernel's socket table. Teardown is asynchronous, so a just-killed listener can
+// briefly still be listed with no owner at all.
+const portReleaseTimeout = 2 * time.Second
+
 // portPreflight decides what to do about the DeepSeek Harness port before
 // launching a new child.
 //
@@ -57,16 +62,30 @@ func dshPortPreflight(dshPort int, recorded *process.State, logf func(string, ..
 			"port %d is in use by pid %d, which dsh-remote did not launch; stop it yourself, or run `dsh-remote start --dsh-port <other port>`", dshPort, owner.PID)
 	}
 
-	// Attributed to the child recorded in run state, and that child's proxy is
-	// gone: this is the orphan. Ask the whole process group to stop, because
-	// npx is only the parent of the real node process.
+	// Attributed to the DeepSeek Harness tree recorded in run state, and that
+	// tree's proxy is gone: this is the orphan. The pid holding the port is the
+	// node child, so the whole process group has to be signalled to reach the
+	// npx shim in front of it -- but only when the group is provably the one
+	// dsh-remote created. A group that merely contains the recorded pid (a
+	// legacy run launched without Setpgid, sharing the operator's shell group)
+	// is not ours to signal, so that case falls back to the single process we
+	// verified.
+	target := owner.PID
+	if owner.PGID > 0 && owner.PGID == recordedPID {
+		target = owner.PGID
+	}
 	if logf != nil {
 		logf("stopping leftover DeepSeek Harness (pid %d) still holding port %d from an earlier run", owner.PID, dshPort)
 	}
-	if err := stopProcessGroup(owner.PID, orphanStopTimeout); err != nil {
+	if err := stopProcessGroup(target, orphanStopTimeout); err != nil {
 		return portUnknown, fmt.Errorf("stop leftover DeepSeek Harness (pid %d): %w", owner.PID, err)
 	}
-	if still := socket.Inspect(dshPort, recordedPID); still.Listening {
+	// The kernel can keep listing a just-killed listener for a moment after the
+	// process that owned it is gone, with no owner left to attribute it to, so
+	// one instant read would report a reclaimed port as still held and hand the
+	// supervisor a failure it would retry forever. Give the socket table a short
+	// bounded moment to settle instead.
+	if !waitForPortFree(dshPort, portReleaseTimeout) {
 		return portUnknown, fmt.Errorf("port %d is still held after stopping pid %d", dshPort, owner.PID)
 	}
 	if recorded != nil {
@@ -77,29 +96,67 @@ func dshPortPreflight(dshPort int, recorded *process.State, logf func(string, ..
 	return portReclaimed, nil
 }
 
+// waitForPortFree reports whether port stopped listening within timeout.
+func waitForPortFree(port int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !socket.Listening(port) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // stopProcessGroup terminates pid and everything in its process group, which is
 // how the npx -> node tree is actually reached. It escalates to SIGKILL after
-// timeout and reports an error only when the process is still alive at the end.
+// timeout and reports an error only when something is still alive at the end.
+//
+// pid may be a group id whose leader has already exited: the node child keeps
+// the group id after the shim dies, which is the orphan this exists to clear.
+// Liveness is therefore decided by the group as well as by the pid -- checking
+// process.Alive(pid) alone returned early and reported success without killing
+// anything, leaving the port held.
 func stopProcessGroup(pid int, timeout time.Duration) error {
-	if pid <= 0 || !process.Alive(pid) {
+	if pid <= 0 {
+		return nil
+	}
+	if !stopTargetAlive(pid) {
 		return nil
 	}
 	_ = signalGroup(pid, syscall.SIGTERM)
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if !process.Alive(pid) {
-			return nil
-		}
-		time.Sleep(100 * time.Millisecond)
+	if waitStopped(pid, timeout) {
+		return nil
 	}
 	_ = signalGroup(pid, syscall.SIGKILL)
-	for i := 0; i < 50; i++ {
-		if !process.Alive(pid) {
-			return nil
+	if waitStopped(pid, 5*time.Second) {
+		return nil
+	}
+	return errors.New("process is still alive after SIGKILL")
+}
+
+// stopTargetAlive reports whether there is anything left to stop: a live member
+// of the process group, or the process itself when it does not lead a group.
+// Exited-but-unreaped members do not count, because they have already released
+// their sockets.
+func stopTargetAlive(pid int) bool {
+	return process.GroupAlive(pid) || process.Alive(pid)
+}
+
+// waitStopped reports whether the target emptied within timeout.
+func waitStopped(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !stopTargetAlive(pid) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return errors.New("process is still alive after SIGKILL")
 }
 
 // signalGroup signals the process group led by pid, falling back to the single
