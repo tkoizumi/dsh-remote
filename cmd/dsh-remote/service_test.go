@@ -26,9 +26,9 @@ func startFlagsFor(t *testing.T, args ...string) (startOptions, []string) {
 	return opts, serviceFlagsSet(fs, opts)
 }
 
-// selfExecutable is the path the unit would have to name for a handoff to be
+// testExecutable is the path a unit would have to name for a handoff to be
 // considered: the binary running this test.
-func selfExecutable(t *testing.T) string {
+func testExecutable(t *testing.T) string {
 	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
@@ -74,7 +74,7 @@ func TestServiceFlagsSetIsAboutConfigurationNotSyntax(t *testing.T) {
 // the unit or refuses. Getting it wrong in the permissive direction is how a
 // foreground proxy ends up racing an enabled unit -- the restart storm.
 func TestServiceRunsThisInvocation(t *testing.T) {
-	self := selfExecutable(t)
+	self := testExecutable(t)
 
 	cases := []struct {
 		name     string
@@ -148,7 +148,7 @@ func TestServiceRunsThisInvocation(t *testing.T) {
 // code that writes the unit: whatever install renders for a configuration must
 // be recognised as that same configuration when `start` is given the same flags.
 func TestServiceRunsThisInvocationRoundTripsTheInstaller(t *testing.T) {
-	self := selfExecutable(t)
+	self := testExecutable(t)
 	opts, set := startFlagsFor(t, "--lan", "--service=hermes=127.0.0.1:9119")
 
 	rendered := installStartFlags(opts.lan, opts.lanAddress, opts.noServe, opts.dshExec, opts.trustedHosts, opts.services)
@@ -211,7 +211,7 @@ func writeUnitWithExecStart(t *testing.T, exe string, args ...string) string {
 // a unit that matches this invocation must be started through systemd, with the
 // command systemd expects -- not by launching a second proxy.
 func TestDelegateToServiceStartsTheMatchingUnit(t *testing.T) {
-	self := selfExecutable(t)
+	self := testExecutable(t)
 	bin, calls := fakeSystemctl(t, "ActiveState=inactive", "Restart=on-failure")
 	home := writeUnitWithExecStart(t, self, "start", "--lan")
 
@@ -238,7 +238,7 @@ func TestDelegateToServiceStartsTheMatchingUnit(t *testing.T) {
 // runs `dsh-remote start`, so if that process delegated to the unit it would
 // either deadlock or exit immediately and leave the service down.
 func TestDelegateToServiceNeverRecurses(t *testing.T) {
-	self := selfExecutable(t)
+	self := testExecutable(t)
 	bin, calls := fakeSystemctl(t, "ActiveState=active", "Restart=on-failure")
 	home := writeUnitWithExecStart(t, self, "start", "--lan")
 
@@ -262,7 +262,7 @@ func TestDelegateToServiceNeverRecurses(t *testing.T) {
 // quietly started as the unit's configuration: it must report what the unit runs
 // and leave systemd alone.
 func TestDelegateToServiceRefusesAMismatch(t *testing.T) {
-	self := selfExecutable(t)
+	self := testExecutable(t)
 	bin, calls := fakeSystemctl(t, "ActiveState=inactive", "Restart=on-failure")
 	home := writeUnitWithExecStart(t, self, "start", "--lan")
 
@@ -349,6 +349,61 @@ func TestRunningAsServiceIsDecidedByCgroupNotEnvironment(t *testing.T) {
 			if got := runningAsService(); got != tc.want {
 				t.Fatalf("runningAsService() = %t, want %t (cgroup %q, INVOCATION_ID %q)",
 					got, tc.want, tc.cgroup, tc.invocation)
+			}
+		})
+	}
+}
+
+// TestClassifyMismatchSeparatesTheTwoCases pins the distinction that keeps the
+// refusal honest. "Same flags, different binary" is the ordinary post-rebuild
+// case; reporting it as a configuration difference, while printing two identical
+// flag lists, sends the operator looking for a problem that does not exist.
+func TestClassifyMismatchSeparatesTheTwoCases(t *testing.T) {
+	self := testExecutable(t)
+	const otherBin = "/home/taka/.local/bin/dsh-remote"
+
+	cases := []struct {
+		name     string
+		unitExe  string
+		unitArgs []string
+		args     []string
+		want     mismatchKind
+	}{
+		{
+			name:     "same flags, different build",
+			unitExe:  otherBin,
+			unitArgs: []string{"start", "--lan"},
+			args:     []string{"--lan"},
+			want:     mismatchBuild,
+		},
+		{
+			name:     "different flags",
+			unitExe:  self,
+			unitArgs: []string{"start", "--lan"},
+			args:     []string{"--no-serve"},
+			want:     mismatchConfig,
+		},
+		{
+			name:     "different port is a configuration difference",
+			unitExe:  otherBin,
+			unitArgs: []string{"start", "--lan"},
+			args:     []string{"--lan", "--dsh-port=3090"},
+			want:     mismatchConfig,
+		},
+		{
+			name:     "the unit runs no start at all",
+			unitExe:  otherBin,
+			unitArgs: []string{"status"},
+			args:     []string{"--lan"},
+			want:     mismatchConfig,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts, _ := startFlagsFor(t, tc.args...)
+			if got := classifyMismatch(tc.unitExe, tc.unitArgs, opts); got != tc.want {
+				t.Fatalf("classifyMismatch(%q, %q, %q) = %v, want %v",
+					tc.unitExe, tc.unitArgs, tc.args, got, tc.want)
 			}
 		})
 	}

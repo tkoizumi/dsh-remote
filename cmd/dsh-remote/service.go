@@ -115,7 +115,7 @@ func delegateToService(opts startOptions, setFlags []string) (bool, error) {
 		return true, fmt.Errorf("read the installed service: %w", err)
 	}
 	if !serviceRunsThisInvocation(unitExe, unitArgs, opts, setFlags) {
-		describeServiceMismatch(unitExe, unitArgs)
+		describeServiceMismatch(unitExe, unitArgs, opts)
 		return true, errors.New("refusing to start a second, unmanaged proxy beside the installed service")
 	}
 
@@ -153,13 +153,19 @@ func serviceRunsThisInvocation(unitExe string, unitArgs []string, opts startOpti
 	if opts.dshPort != defaultDSHPort || opts.proxyPort != defaultProxyPort {
 		return false
 	}
-	if len(unitArgs) == 0 || unitArgs[0] != "start" {
-		return false
-	}
 	// The binary matters as much as the flags: after a rebuild, delegating to a
 	// unit that points at an older installed build would quietly run the wrong
 	// code -- the opposite of what someone who just built this expects.
 	if !sameExecutable(unitExe) {
+		return false
+	}
+	return sameServiceFlags(unitArgs, opts)
+}
+
+// sameServiceFlags reports whether the unit's argument vector is the flags this
+// invocation asked for.
+func sameServiceFlags(unitArgs []string, opts startOptions) bool {
+	if len(unitArgs) == 0 || unitArgs[0] != "start" {
 		return false
 	}
 	want, err := systemd.SplitCommand(strings.TrimSpace(installStartFlags(
@@ -170,15 +176,24 @@ func serviceRunsThisInvocation(unitExe string, unitArgs []string, opts startOpti
 	return slices.Equal(want, unitArgs[1:])
 }
 
-// sameExecutable reports whether path names the running dsh-remote, resolving
-// symlinks the same way `install` does when it writes ExecStart.
-func sameExecutable(path string) bool {
+// selfExecutable returns the running binary's path with symlinks resolved, the
+// same way `install` does when it writes ExecStart.
+func selfExecutable() (string, bool) {
 	self, err := os.Executable()
 	if err != nil {
-		return false
+		return "", false
 	}
 	if resolved, err := filepath.EvalSymlinks(self); err == nil {
 		self = resolved
+	}
+	return self, true
+}
+
+// sameExecutable reports whether path names the running dsh-remote.
+func sameExecutable(path string) bool {
+	self, ok := selfExecutable()
+	if !ok {
+		return false
 	}
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		path = resolved
@@ -186,9 +201,41 @@ func sameExecutable(path string) bool {
 	return filepath.Clean(self) == filepath.Clean(path)
 }
 
-// describeServiceMismatch explains what the installed service runs, and the two
-// ways to proceed, rather than leaving the operator to guess.
-func describeServiceMismatch(unitExe string, unitArgs []string) {
+// mismatchKind says why the installed unit is not this invocation, so the
+// explanation can be specific. "Same flags, different binary" is the ordinary
+// case after a rebuild, and it needs a different instruction from a genuine
+// configuration difference -- saying "different configuration" while printing
+// two identical flag lists is how an operator ends up hunting a problem that is
+// not there.
+type mismatchKind int
+
+const (
+	mismatchConfig mismatchKind = iota
+	mismatchBuild
+)
+
+// classifyMismatch distinguishes the two cases.
+func classifyMismatch(unitExe string, unitArgs []string, opts startOptions) mismatchKind {
+	portsDefault := opts.dshPort == defaultDSHPort && opts.proxyPort == defaultProxyPort
+	if portsDefault && sameServiceFlags(unitArgs, opts) && !sameExecutable(unitExe) {
+		return mismatchBuild
+	}
+	return mismatchConfig
+}
+
+// describeServiceMismatch explains what the installed service runs, and the ways
+// to proceed, rather than leaving the operator to guess.
+func describeServiceMismatch(unitExe string, unitArgs []string, opts startOptions) {
+	if classifyMismatch(unitExe, unitArgs, opts) == mismatchBuild {
+		self, _ := selfExecutable()
+		fmt.Fprintln(os.Stderr, "the installed service runs a different build of dsh-remote:")
+		fmt.Fprintf(os.Stderr, "  service: %s\n", unitExe)
+		fmt.Fprintf(os.Stderr, "  you ran: %s\n", self)
+		fmt.Fprintf(os.Stderr, "  install this build: install -m755 %s %s.new && mv -f %s.new %s\n",
+			self, unitExe, unitExe, unitExe)
+		fmt.Fprintln(os.Stderr, "  run here anyway:    dsh-remote start --foreground")
+		return
+	}
 	fmt.Fprintf(os.Stderr, "the installed service (%s) runs a different configuration:\n", systemd.UnitName)
 	fmt.Fprintf(os.Stderr, "  service: %s\n", strings.Join(append([]string{unitExe}, unitArgs...), " "))
 	fmt.Fprintf(os.Stderr, "  you ran: %s\n", strings.Join(os.Args, " "))
