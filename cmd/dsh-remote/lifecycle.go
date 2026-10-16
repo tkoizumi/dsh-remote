@@ -12,6 +12,7 @@ import (
 	"github.com/tkoizumi/dsh-remote/internal/process"
 	"github.com/tkoizumi/dsh-remote/internal/proxy"
 	"github.com/tkoizumi/dsh-remote/internal/qr"
+	"github.com/tkoizumi/dsh-remote/internal/systemd"
 	"github.com/tkoizumi/dsh-remote/internal/tailscale"
 )
 
@@ -28,6 +29,23 @@ func runStop(args []string) error {
 	if log != nil {
 		defer log.Close()
 		log.Logf("stop requested")
+	}
+
+	// When systemd is running this deployment, stop it through systemd rather
+	// than signalling its pid out from under the unit.
+	if handled, err := delegateStop(*proxyPort); handled {
+		if err != nil {
+			return err
+		}
+		if log != nil {
+			log.Logf("stop: handed to %s", systemd.UnitName)
+		}
+		sweepLeftoverState(*proxyPort, log)
+		fmt.Println("Stopped. Tailscale itself was left untouched.")
+		if log != nil {
+			log.Logf("stop complete")
+		}
+		return nil
 	}
 
 	start, err := process.LoadState()
@@ -66,22 +84,31 @@ func runStop(args []string) error {
 
 	// If the start process was killed hard it could not restore Serve or clear
 	// state, so finish the job here. Otherwise the file is already gone.
-	if remaining, err := process.LoadState(); err == nil && remaining != nil {
-		if remaining.ServeConfigured {
-			restoreServeOnStop(remaining.PriorServeTarget, *proxyPort, log)
-		}
-		restoreServiceServeOnStop(remaining.Services, log)
-		if err := process.RemoveState(); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not remove state file: %v\n", err)
-		} else if log != nil {
-			log.Logf("state: removed")
-		}
-	}
+	sweepLeftoverState(*proxyPort, log)
 	fmt.Println("Stopped. Tailscale itself was left untouched.")
 	if log != nil {
 		log.Logf("stop complete")
 	}
 	return nil
+}
+
+// sweepLeftoverState restores Serve and clears run state that an unclean exit
+// left behind. It is idempotent: after a clean shutdown the state file is
+// already gone and this does nothing.
+func sweepLeftoverState(proxyPort int, log *logging.Logger) {
+	remaining, err := process.LoadState()
+	if err != nil || remaining == nil {
+		return
+	}
+	if remaining.ServeConfigured {
+		restoreServeOnStop(remaining.PriorServeTarget, proxyPort, log)
+	}
+	restoreServiceServeOnStop(remaining.Services, log)
+	if err := process.RemoveState(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not remove state file: %v\n", err)
+	} else if log != nil {
+		log.Logf("state: removed")
+	}
 }
 
 // restoreServeOnStop undoes the Serve mapping dsh-remote created, without ever

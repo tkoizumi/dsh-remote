@@ -1,8 +1,10 @@
-// Package systemd reports whether dsh-remote is supervised by a systemd unit.
+// Package systemd reports whether dsh-remote is supervised by a systemd unit,
+// and drives that unit's lifecycle when it owns the deployment.
 //
-// It only reads state. The `install` command owns writing units, so this package
-// never enables, starts, or edits anything; it exists so `status` and `doctor`
-// can explain why an unattended deployment will not recover on its own.
+// It never writes units -- `install` owns the unit file. This package reads the
+// unit's state and its ExecStart= line, and can ask systemd to start or stop it,
+// so `start` and `stop` can hand off to the service instead of leaving a second,
+// unmanaged proxy running beside it.
 package systemd
 
 import (
@@ -140,11 +142,18 @@ func (s State) CanRecover() bool {
 }
 
 func (c *Client) exec(ctx context.Context, args ...string) ([]byte, error) {
+	return c.execTimeout(ctx, commandTimeout, args...)
+}
+
+// execTimeout is exec with an explicit deadline. A lifecycle verb needs longer
+// than a query: `systemctl stop` waits for the unit's own teardown, which can
+// legitimately take as long as the service needs to restore Serve.
+func (c *Client) execTimeout(ctx context.Context, timeout time.Duration, args ...string) ([]byte, error) {
 	argv := append([]string{"--user"}, args...)
 	if c.run != nil {
 		return c.run(ctx, argv)
 	}
-	ctx, cancel := context.WithTimeout(ctx, commandTimeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	bin := c.Bin
 	if bin == "" {

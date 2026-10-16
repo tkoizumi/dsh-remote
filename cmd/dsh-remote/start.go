@@ -43,6 +43,7 @@ type startOptions struct {
 	lanAddress   string
 	noServe      bool
 	noQR         bool
+	foreground   bool
 	tokenTimeout time.Duration
 }
 
@@ -59,13 +60,10 @@ func (s *stringList) Set(value string) error {
 	return nil
 }
 
-// runStart is declared with a named error result so the deferred teardown can
-// record why the run ended. Without it, a preflight refusal or a bind failure
-// was logged as "shutdown: unknown", which reads like an unexplained crash --
-// exactly what the persistent log exists to rule out.
-func runStart(args []string) (err error) {
-	fs := flag.NewFlagSet("start", flag.ContinueOnError)
-	var opts startOptions
+// registerStartFlags defines the `start` flag set. It is separate from runStart
+// so tests can parse the real defaults -- the service handoff decision turns on
+// which flags were actually set, and a hand-rolled copy would drift.
+func registerStartFlags(fs *flag.FlagSet, opts *startOptions) {
 	fs.IntVar(&opts.dshPort, "dsh-port", defaultDSHPort, "loopback port for DeepSeek Harness")
 	fs.IntVar(&opts.proxyPort, "proxy-port", defaultProxyPort, "loopback port for the stable proxy")
 	fs.StringVar(&opts.npx, "npx", "npx", "npx executable to launch DeepSeek Harness with")
@@ -77,7 +75,18 @@ func runStart(args []string) (err error) {
 	fs.StringVar(&opts.lanAddress, "lan-address", "", "local network address to bind for --lan (default: detected)")
 	fs.BoolVar(&opts.noServe, "no-serve", false, "do not touch the Tailscale Serve configuration")
 	fs.BoolVar(&opts.noQR, "no-qr", false, "do not print a QR code")
+	fs.BoolVar(&opts.foreground, "foreground", false, "run in this terminal instead of handing off to the installed systemd service")
 	fs.DurationVar(&opts.tokenTimeout, "token-timeout", 90*time.Second, "how long to wait for DeepSeek Harness to print its token URL")
+}
+
+// runStart is declared with a named error result so the deferred teardown can
+// record why the run ended. Without it, a preflight refusal or a bind failure
+// was logged as "shutdown: unknown", which reads like an unexplained crash --
+// exactly what the persistent log exists to rule out.
+func runStart(args []string) (err error) {
+	fs := flag.NewFlagSet("start", flag.ContinueOnError)
+	var opts startOptions
+	registerStartFlags(fs, &opts)
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: dsh-remote start [flags]")
 		fs.PrintDefaults()
@@ -92,6 +101,15 @@ func runStart(args []string) (err error) {
 	}
 	if len(specs) > 0 && opts.noServe && !opts.lan {
 		return errors.New("--service needs somewhere to serve: drop --no-serve (for the tailnet URL) or add --lan (for the local network URL)")
+	}
+
+	// Once a unit is installed it owns this deployment, so `start` drives it
+	// rather than racing it with a second, unmanaged proxy. --foreground keeps
+	// the in-terminal behaviour for debugging.
+	if !opts.foreground {
+		if handled, err := delegateToService(opts, serviceFlagsSet(fs, opts)); handled {
+			return err
+		}
 	}
 
 	existing, err := process.LoadState()
@@ -817,7 +835,7 @@ func verifyLANListener(ln net.Listener, lanAddr string, port int, log *logging.L
 // `systemctl --user start` is refused -- the run-state guard sees the running
 // proxy first.
 func warnIfUnmanagedNextToService(log *logging.Logger) {
-	if os.Getenv("INVOCATION_ID") != "" {
+	if runningAsService() {
 		return // systemd started this run; the unit owns it
 	}
 	path, err := systemd.New().UnitPath()
@@ -845,7 +863,7 @@ func warnIfUnmanagedNextToService(log *logging.Logger) {
 // difference between "stopped" and "vanished", so say so at start time rather
 // than let the operator discover it from an outage.
 func warnIfTTYWithoutSupervisor(log *logging.Logger) {
-	if os.Getenv("INVOCATION_ID") != "" {
+	if runningAsService() {
 		return // systemd started this run; it has no controlling terminal
 	}
 	if !hasControllingTTY() {
