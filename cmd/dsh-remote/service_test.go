@@ -306,3 +306,50 @@ func TestDelegateStopStopsTheActiveUnit(t *testing.T) {
 		t.Fatal("delegateStop claimed a non-default proxy port belonged to the unit")
 	}
 }
+
+// TestRunningAsServiceIsDecidedByCgroupNotEnvironment pins the guard that keeps
+// the unit's own `start` from delegating to itself. The invocation id is
+// inherited by every descendant -- DSH runs agent commands in systemd scopes --
+// so trusting it alone would make an agent-issued `start` claim to be the
+// service. A cgroup view that names no unit (a cgroup namespace) must fall back
+// to the invocation id rather than conclude "not the service", because the
+// opposite mistake makes the unit never start.
+func TestRunningAsServiceIsDecidedByCgroupNotEnvironment(t *testing.T) {
+	const (
+		unitCgroup  = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/dsh-remote.service\n"
+		scopeCgroup = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/dsh-subprocess-123-a1b2.scope\n"
+		hiddenView  = "0::/\n"
+	)
+
+	cases := []struct {
+		name       string
+		cgroup     string
+		unreadable bool
+		invocation string
+		want       bool
+	}{
+		{"the unit's own process", unitCgroup, false, "abc", true},
+		{"a DSH agent scope that inherited the invocation id", scopeCgroup, false, "abc", false},
+		{"a cgroup namespace hides the unit name", hiddenView, false, "abc", true},
+		{"hidden view and no invocation id", hiddenView, false, "", false},
+		{"unreadable cgroup falls back to the invocation id", "", true, "abc", true},
+		{"unreadable cgroup and none set", "", true, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := cgroupData
+			t.Cleanup(func() { cgroupData = prev })
+			if tc.unreadable {
+				cgroupData = func() ([]byte, error) { return nil, os.ErrNotExist }
+			} else {
+				cgroupData = func() ([]byte, error) { return []byte(tc.cgroup), nil }
+			}
+			t.Setenv("INVOCATION_ID", tc.invocation)
+
+			if got := runningAsService(); got != tc.want {
+				t.Fatalf("runningAsService() = %t, want %t (cgroup %q, INVOCATION_ID %q)",
+					got, tc.want, tc.cgroup, tc.invocation)
+			}
+		})
+	}
+}

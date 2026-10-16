@@ -53,6 +53,11 @@ var (
 	insideService    = runningAsService
 )
 
+// cgroupData reads this process's cgroup membership. Overridable so the
+// membership decision can be tested for both the normal view and a cgroup
+// namespace that hides the unit name.
+var cgroupData = func() ([]byte, error) { return os.ReadFile("/proc/self/cgroup") }
+
 // runningAsService reports whether this process is the systemd unit's own main
 // process, rather than something that merely inherited systemd's environment.
 //
@@ -64,12 +69,18 @@ var (
 // not lie. The service's own process is in the unit's cgroup; anything systemd
 // started separately, including a task in another scope, is not.
 //
-// If the cgroup file cannot be read, the invocation id is all that is left, and
-// trusting it is the safe direction: assuming "we are the service" avoids
-// launching a second proxy under a unit.
+// A cgroup view can be made uninformative -- ProtectControlGroups=private or
+// strict hides everything but "/" -- so a view that names no unit at all falls
+// back to the invocation id rather than concluding "not the service". Trusting
+// it there is the safe direction: assuming "we are the service" avoids launching
+// a second proxy under a unit, whereas the opposite would make the unit delegate
+// to itself and never come up.
 func runningAsService() bool {
-	if data, err := os.ReadFile("/proc/self/cgroup"); err == nil {
-		return strings.Contains(string(data), systemd.UnitName)
+	if data, err := cgroupData(); err == nil {
+		text := string(data)
+		if strings.Contains(text, ".service") || strings.Contains(text, ".scope") {
+			return strings.Contains(text, systemd.UnitName)
+		}
 	}
 	return os.Getenv("INVOCATION_ID") != ""
 }
